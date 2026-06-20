@@ -1,0 +1,126 @@
+import os
+import numpy as np
+import rosbag2_py
+from rclpy.serialization import deserialize_message
+from rosidl_runtime_py.utilities import get_message
+import cv2
+from scipy.spatial.transform import Rotation
+from ram_vi_slam.tracking import RGBDTracker
+from ram_vi_slam.imu_models import GyroGuidedEstimator
+from ram_vi_slam.mapping import SurfelMap
+
+FX_C = 610.1809082;  FY_C = 610.26391602
+CX_C = 337.1600647;  CY_C = 249.06201172
+FX_D = 388.2460022;  FY_D = 388.2460022
+CX_D = 313.19522095; CY_D = 243.97851562
+
+R_D2C = np.array([
+    [ 0.99999636, -0.00241311,  0.00117634],
+    [ 0.00241741,  0.99999034, -0.00367048],
+    [-0.00116747,  0.00367331,  0.99999255]
+])
+T_D2C = np.array([0.01454706, 0.00018594, 0.00039981])
+R_D2I = np.eye(3)
+T_D2I = np.array([-0.00552, 0.0051, 0.01174])
+
+T_d2c = np.eye(4); T_d2c[0:3, 0:3] = R_D2C; T_d2c[0:3, 3] = T_D2C
+T_d2i = np.eye(4); T_d2i[0:3, 0:3] = R_D2I; T_d2i[0:3, 3] = T_D2I
+T_c2i = T_d2i @ np.linalg.inv(T_d2c)
+
+roll_rad = np.radians(-3.5)
+R_corr = Rotation.from_euler('xyz', [roll_rad, 0.0, 0.0]).as_matrix()
+T_c2i[0:3, 0:3] = T_c2i[0:3, 0:3] @ R_corr
+
+T_i2c = np.linalg.inv(T_c2i)
+
+bag_path = "/home/rv/RAM_VI_SLAM/slam_benchmark_run1"
+reader = rosbag2_py.SequentialReader()
+reader.open(
+    rosbag2_py.StorageOptions(uri=bag_path, storage_id='sqlite3'),
+    rosbag2_py.ConverterOptions('cdr', 'cdr')
+)
+topic_types = {t.name: t.type for t in reader.get_all_topics_and_types()}
+
+tracker = RGBDTracker(FX_C, FY_C, CX_C, CY_C)
+K_d_mat = np.array([[FX_D, 0.0,  CX_D], [0.0,  FY_D, CY_D], [0.0,  0.0,  1.0]])
+tracker.set_calibration(K_d_mat, R_D2C, T_D2C)
+
+eskf = GyroGuidedEstimator()
+surfel_map = SurfelMap(FX_C, FY_C, CX_C, CY_C)
+
+latest_color = None
+latest_depth = None
+latest_color_t = 0
+latest_depth_t = 0
+frame_count = 0
+
+imu_history = []
+last_imu_t = None
+curr_acc = np.array([0.0, 0.0, -9.80665])
+curr_gyr = np.array([0.0, 0.0, 0.0])
+T_wc = np.eye(4)
+T_wc_prev = np.eye(4)
+last_frame_t = None
+
+# R_w2v
+R_w2v = np.array([
+    [1.0,  0.0,  0.0],
+    [0.0, -1.0,  0.0],
+    [0.0,  0.0, -1.0]
+])
+
+print("Fusing first frame...")
+while reader.has_next() and frame_count < 2:
+    topic, data, t_msg = reader.read_next()
+    if topic == '/camera/camera/color/image_raw':
+        msg = deserialize_message(data, get_message(topic_types[topic]))
+        latest_color = np.frombuffer(msg.data, dtype=np.uint8).reshape((msg.height, msg.width, 3))
+        latest_color = cv2.cvtColor(latest_color, cv2.COLOR_BGR2RGB)
+        latest_color_t = t_msg
+    elif topic == '/camera/camera/depth/image_rect_raw':
+        msg = deserialize_message(data, get_message(topic_types[topic]))
+        latest_depth = np.frombuffer(msg.data, dtype=np.uint16).reshape((msg.height, msg.width))
+        latest_depth_t = t_msg
+        
+    if latest_color is not None and latest_depth is not None:
+        time_diff = abs(latest_color_t - latest_depth_t) * 1e-6
+        if time_diff < 30.0:
+            frame_t = min(latest_color_t, latest_depth_t)
+            frame_dt = 0.033
+            
+            depth_m = tracker.register_depth(latest_depth)
+            
+            if frame_count == 0:
+                T_wc = T_c2i
+                
+            surfel_map.fuse_frame(latest_color, depth_m, T_wc, frame_count, 0)
+            frame_count += 1
+            latest_color = None
+            latest_depth = None
+
+# Get points
+pos = surfel_map.positions[:surfel_map.active_n].cpu().numpy()
+col = surfel_map.colors[:surfel_map.active_n].cpu().numpy()
+pos_vis = pos @ R_w2v.T
+
+# Find ceiling (dark corrugated sheets, which are brown/grey)
+# In color_frame_0, the top part is ceiling, bottom is floor.
+# Let's inspect the original depth/camera points.
+# Since we backprojected:
+# y_cam = (vv - cy) * z_cam / fy
+# Floor points (large vv) should have positive y_world.
+# Ceiling points (small vv) should have negative y_world.
+# Let's check a sample of points where y_world is minimum (should be ceiling)
+# and maximum (should be floor).
+min_y_idx = np.argmin(pos[:, 1])
+max_y_idx = np.argmax(pos[:, 1])
+
+print(f"\nCeiling candidate (min y_world):")
+print(f"  pos (world): {pos[min_y_idx]}")
+print(f"  pos_vis:     {pos_vis[min_y_idx]}")
+print(f"  color (RGB): {col[min_y_idx] * 255.0}")
+
+print(f"\nFloor candidate (max y_world):")
+print(f"  pos (world): {pos[max_y_idx]}")
+print(f"  pos_vis:     {pos_vis[max_y_idx]}")
+print(f"  color (RGB): {col[max_y_idx] * 255.0}")

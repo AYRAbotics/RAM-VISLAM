@@ -1,0 +1,29 @@
+# ROS 2 Build & Install Directories
+build/
+install/
+log/
+
+# Dataset & heavy bags
+slam_benchmark_run1/
+*.db3
+*.mcap
+
+# Large output files (PLY map, trajectories)
+output/
+
+# Python Cache & virtual environments
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# IDE settings
+.vscode/
+.idea/
+.gemini/
+.antigravity-ide/
+.antigravityignore
