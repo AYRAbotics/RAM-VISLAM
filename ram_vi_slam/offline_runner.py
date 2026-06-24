@@ -75,6 +75,7 @@ def main():
     parser.add_argument('--yaw_offset', type=float, default=0.0, help='Camera-IMU yaw offset in degrees')
     parser.add_argument('--flat_ground', action=argparse.BooleanOptionalAction, default=True, help='Enforce flat ground constraint (constant height) to eliminate vertical drift/noise')
     parser.add_argument('--imu_time_delay', type=float, default=0.0, help='Time shift in seconds to apply to IMU timestamps (imu_t += delay) to compensate for camera latency')
+    parser.add_argument('--translation_damping', type=float, default=100.0, help='Damping coefficient to suppress rotation-translation leakage in visual odometry during turns')
     args = parser.parse_args()
 
     print(f"OfflineRunner: Starting processing on {args.bag_path} using IMU model: {args.imu_model}")
@@ -100,7 +101,7 @@ def main():
     else:
         raise ValueError(f"Unknown imu_model: {args.imu_model}")
         
-    tracker = RGBDTracker(FX_C, FY_C, CX_C, CY_C)
+    tracker = RGBDTracker(FX_C, FY_C, CX_C, CY_C, translation_damping=args.translation_damping)
     
     # Extrinsics matrices
     T_d2c = np.eye(4)

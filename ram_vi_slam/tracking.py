@@ -6,9 +6,10 @@ from scipy.spatial.transform import Rotation
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class RGBDTracker:
-    def __init__(self, fx_c, fy_c, cx_c, cy_c, width=640, height=480):
+    def __init__(self, fx_c, fy_c, cx_c, cy_c, width=640, height=480, translation_damping=0.0):
         self.width = width
         self.height = height
+        self.translation_damping = translation_damping
         self.fx_c = fx_c
         self.fy_c = fy_c
         self.cx_c = cx_c
@@ -168,10 +169,19 @@ class RGBDTracker:
             
             # Verify tracking fitness
             if icp_result.fitness > 0.30:
-                # Return target -> source transform by inverting the src -> tgt result
-                return True, np.linalg.inv(icp_result.transformation)
+                T_rel = np.linalg.inv(icp_result.transformation)
+                if self.translation_damping > 0.0:
+                    r_angle = np.linalg.norm(Rotation.from_matrix(T_rel[0:3, 0:3]).as_rotvec())
+                    damping_factor = np.exp(-self.translation_damping * r_angle)
+                    T_rel[0:3, 3] = T_rel[0:3, 3] * damping_factor
+                return True, T_rel
         except Exception:
             pass
 
         # If ICP fails, return success and target -> source camera motion
-        return success, np.linalg.inv(T_odom)
+        T_rel = np.linalg.inv(T_odom)
+        if success and self.translation_damping > 0.0:
+            r_angle = np.linalg.norm(Rotation.from_matrix(T_rel[0:3, 0:3]).as_rotvec())
+            damping_factor = np.exp(-self.translation_damping * r_angle)
+            T_rel[0:3, 3] = T_rel[0:3, 3] * damping_factor
+        return success, T_rel

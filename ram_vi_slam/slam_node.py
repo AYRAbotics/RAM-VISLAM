@@ -67,6 +67,8 @@ class SlamNode(Node):
         self.flat_ground = self.get_parameter('flat_ground').get_value()
         self.declare_parameter('imu_time_delay', 0.0)
         self.imu_time_delay = self.get_parameter('imu_time_delay').get_value()
+        self.declare_parameter('translation_damping', 100.0)
+        self.translation_damping = self.get_parameter('translation_damping').get_value()
         self.z_fixed = 0.0
         self.z_fixed_initialized = False
         
@@ -178,7 +180,7 @@ class SlamNode(Node):
         
         self.get_logger().info(f"SlamNode: Received CameraInfo. Intrinsics: fx={fx}, fy={fy}, cx={cx}, cy={cy}")
         
-        self.tracker = RGBDTracker(fx, fy, cx, cy, width=msg.width, height=msg.height)
+        self.tracker = RGBDTracker(fx, fy, cx, cy, width=msg.width, height=msg.height, translation_damping=self.translation_damping)
         
         # Create corresponding depth camera calibration using the correct depth camera intrinsics
         K_d = np.array([
