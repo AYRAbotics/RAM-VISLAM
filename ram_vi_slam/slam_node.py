@@ -61,10 +61,12 @@ class SlamNode(Node):
         self.pitch_off = self.get_parameter('camera_imu_pitch_offset').get_value()
         self.yaw_off = self.get_parameter('camera_imu_yaw_offset').get_value()
         
-        self.declare_parameter('imu_model', 'imufusion')
+        self.declare_parameter('imu_model', 'complementary')
         self.imu_model = self.get_parameter('imu_model').get_value()
         self.declare_parameter('flat_ground', True)
         self.flat_ground = self.get_parameter('flat_ground').get_value()
+        self.declare_parameter('imu_time_delay', 0.0)
+        self.imu_time_delay = self.get_parameter('imu_time_delay').get_value()
         self.z_fixed = 0.0
         self.z_fixed_initialized = False
         
@@ -198,12 +200,14 @@ class SlamNode(Node):
     def on_accel(self, msg):
         acc = np.array([msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z])
         t_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
-        self.imu_history.append((t_ns, 'accel', acc))
+        t_shifted = t_ns + int(self.imu_time_delay * 1_000_000_000)
+        self.imu_history.append((t_shifted, 'accel', acc))
 
     def on_gyro(self, msg):
         gyr = np.array([msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z])
         t_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
-        self.imu_history.append((t_ns, 'gyro', gyr))
+        t_shifted = t_ns + int(self.imu_time_delay * 1_000_000_000)
+        self.imu_history.append((t_shifted, 'gyro', gyr))
 
     def on_frame_pair(self, color_msg, depth_msg):
         """Fuses synchronized color and depth frames."""
