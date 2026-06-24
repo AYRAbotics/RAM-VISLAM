@@ -129,6 +129,9 @@ class RGBDTracker:
             depth_scale=1.0, depth_trunc=8.0
         )
 
+        # Convert target -> source camera motion (T_init) to source -> target point transform
+        T_init_point = np.linalg.inv(T_init)
+
         # 1. Open3D Hybrid RGB-D Odometry
         option = o3d.pipelines.odometry.OdometryOption()
         option.depth_diff_max = 0.07
@@ -137,7 +140,7 @@ class RGBDTracker:
 
         try:
             success, T_odom, info = o3d.pipelines.odometry.compute_rgbd_odometry(
-                src_rgbd, tgt_rgbd, self.intrinsic_o3d, T_init,
+                src_rgbd, tgt_rgbd, self.intrinsic_o3d, T_init_point,
                 o3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm(),
                 option
             )
@@ -145,7 +148,7 @@ class RGBDTracker:
             success = False
 
         if not success:
-            T_odom = T_init
+            T_odom = T_init_point
 
         # 2. Point-to-Plane ICP refinement
         try:
@@ -157,9 +160,9 @@ class RGBDTracker:
                 o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
             )
             
-            # registration_icp maps src -> tgt, so initial guess must be T_odom^-1 (tgt -> src)
+            # registration_icp maps src -> tgt, so initial guess must be T_odom (src -> tgt)
             icp_result = o3d.pipelines.registration.registration_icp(
-                src_pcd, tgt_pcd, 0.05, np.linalg.inv(T_odom),
+                src_pcd, tgt_pcd, 0.05, T_odom,
                 o3d.pipelines.registration.TransformationEstimationPointToPlane()
             )
             
@@ -170,4 +173,5 @@ class RGBDTracker:
         except Exception:
             pass
 
-        return success, T_odom
+        # If ICP fails, return success and target -> source camera motion
+        return success, np.linalg.inv(T_odom)

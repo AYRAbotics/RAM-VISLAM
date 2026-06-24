@@ -73,6 +73,7 @@ def main():
     parser.add_argument('--roll-offset', type=float, default=-3.5, help='Roll offset in degrees (X axis)')
     parser.add_argument('--pitch_offset', type=float, default=0.0, help='Camera-IMU pitch offset in degrees')
     parser.add_argument('--yaw_offset', type=float, default=0.0, help='Camera-IMU yaw offset in degrees')
+    parser.add_argument('--flat_ground', action=argparse.BooleanOptionalAction, default=True, help='Enforce flat ground constraint (constant height) to eliminate vertical drift/noise')
     args = parser.parse_args()
 
     print(f"OfflineRunner: Starting processing on {args.bag_path} using IMU model: {args.imu_model}")
@@ -80,7 +81,7 @@ def main():
     visualizer = None
     if args.visualize:
         from .visualization import SLAMVisualizer
-        gravity_aligned = args.imu_model in ['eskf', 'complementary']
+        gravity_aligned = args.imu_model in ['eskf', 'complementary', 'imufusion']
         visualizer = SLAMVisualizer(width=640, height=480, gravity_aligned=gravity_aligned)
 
     
@@ -157,6 +158,8 @@ def main():
     T_wc = np.eye(4)  # Camera pose
     T_wc_prev = np.eye(4)
     
+    z_fixed = 0.0
+    z_fixed_initialized = False
     start_time = time.time()
     
     exit_requested = [False]
@@ -203,6 +206,7 @@ def main():
             time_diff = abs(latest_color_t - latest_depth_t) * 1e-6  # ms
             if time_diff < 30.0:  # sync within 30 ms
                 frame_t = min(latest_color_t, latest_depth_t)
+                z_drift = 0.0
                 frame_dt = 0.033
                 if frame_count > 0 and last_frame_t is not None:
                     frame_dt = (frame_t - last_frame_t) * 1e-9
@@ -247,6 +251,17 @@ def main():
                 if frame_count == 0:
                     T_wc = T_pred
                     track_success = True
+                    T_wi_init = T_wc @ T_i2c
+                    z_fixed = T_wi_init[2, 3]
+                    
+                    flat_ground_active = args.flat_ground
+                    if visualizer is not None:
+                        flat_ground_active = visualizer.z_lock
+                        
+                    if flat_ground_active:
+                        z_fixed_initialized = True
+                        if hasattr(eskf, 'p'):
+                            eskf.p[2] = z_fixed
                 else:
                     # Compute predicted relative motion from previous frame to current frame
                     T_init_rel = np.linalg.inv(T_wc_prev) @ T_pred
@@ -291,13 +306,34 @@ def main():
                     
                     eskf.update(T_wi[0:3, 3], T_wi[0:3, 0:3], pos_noise_scale=pos_scale, rot_noise_scale=rot_scale, dt=frame_dt)
                     
-                    # Feed back the updated ESKF filtered pose to T_wc
-                    T_wi_filt = np.eye(4)
+                    # Feed back the updated ESKF filtered rotation to T_wc
                     if hasattr(eskf, 'R'):
-                        T_wi_filt[0:3, 0:3] = eskf.R.as_matrix()
+                        T_wc[0:3, 0:3] = eskf.R.as_matrix() @ T_c2i[0:3, 0:3]
+                    # Also update the ESKF internal position to match tracking to avoid accelerometer noise injection
                     if hasattr(eskf, 'p'):
-                        T_wi_filt[0:3, 3] = eskf.p
-                    T_wc = T_wi_filt @ T_c2i
+                        T_wi = T_wc @ T_i2c
+                        eskf.p = T_wi[0:3, 3]
+                    
+                    # Apply flat ground height constraint to camera pose and ESKF state
+                    flat_ground_active = args.flat_ground
+                    if visualizer is not None:
+                        flat_ground_active = visualizer.z_lock
+                    
+                    T_wi_curr = T_wc @ T_i2c
+                    if flat_ground_active:
+                        if not z_fixed_initialized:
+                            z_fixed = T_wi_curr[2, 3]
+                            z_fixed_initialized = True
+                        z_drift = T_wi_curr[2, 3] - z_fixed
+                        T_wi_curr[2, 3] = z_fixed
+                        T_wc = T_wi_curr @ T_c2i
+                        if hasattr(eskf, 'p'):
+                            eskf.p[2] = z_fixed
+                        if hasattr(eskf, 'v'):
+                            eskf.v[2] = 0.0
+                    else:
+                        z_fixed_initialized = False
+                        z_drift = T_wi_curr[2, 3] - z_fixed
                     
                     # F. Manage Mapping & Keyframes
                     is_kf = False
@@ -367,7 +403,10 @@ def main():
                         
                     # Live Visualisation
                     if visualizer is not None:
-                        visualizer.update(T_wc, surfel_map, latest_color, depth_m)
+                        visualizer.update(T_wc, surfel_map, latest_color, depth_m, z_drift=z_drift)
+                        if visualizer.save_requested:
+                            print("\nOfflineRunner: Save & Exit requested from HUD buttons. Exiting loop...", flush=True)
+                            break
                         
                 # Progress logging
                 if frame_count % 50 == 0:

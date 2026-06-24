@@ -112,7 +112,7 @@ class ESKF:
         
         self.P = Fx @ self.P @ Fx.T + Q
 
-    def update(self, p_meas, R_meas, pos_noise_scale=1.0, rot_noise_scale=1.0):
+    def update(self, p_meas, R_meas, pos_noise_scale=1.0, rot_noise_scale=1.0, *args, **kwargs):
         """Correct state using camera tracking update (pose of IMU in world)."""
         if not self.is_gravity_initialized:
             return

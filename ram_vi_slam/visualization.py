@@ -73,8 +73,33 @@ class SLAMVisualizer:
 
         # Counter to throttle updates
         self.frame_idx = 0
+        
+        # GUI Interactive State
+        self.view_mode = "free" # "free", "follow", "top"
+        self.z_lock = True
+        self.save_requested = False
+        self.hud_window_name = "RAM-SLAM Tracking HUD (ElasticFusion)"
+        cv2.namedWindow(self.hud_window_name)
+        cv2.setMouseCallback(self.hud_window_name, self.on_mouse)
 
-    def update(self, T_wc, surfel_map, latest_color, depth_m):
+    def on_mouse(self, event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            # Check button click coordinates (at bottom of HUD)
+            # Button 1 ("Save & Exit"): x in [10, 200], y in [self.height + 10, self.height + 50]
+            # Button 2 ("View Mode"): x in [220, 450], y in [self.height + 10, self.height + 50]
+            if 10 <= x <= 200 and (self.height + 10) <= y <= (self.height + 50):
+                print("GUI: Save & Exit button clicked!", flush=True)
+                self.save_requested = True
+            elif 220 <= x <= 450 and (self.height + 10) <= y <= (self.height + 50):
+                modes = ["free", "follow", "top"]
+                idx = modes.index(self.view_mode)
+                self.view_mode = modes[(idx + 1) % len(modes)]
+                print(f"GUI: View mode changed to: {self.view_mode.upper()}", flush=True)
+            elif 470 <= x <= 700 and (self.height + 10) <= y <= (self.height + 50):
+                self.z_lock = not self.z_lock
+                print(f"GUI: Z Lock toggled to: {'ON' if self.z_lock else 'OFF'}", flush=True)
+
+    def update(self, T_wc, surfel_map, latest_color, depth_m, z_drift=0.0):
         """
         Update the 3D visualizer and the 2D tracking HUD.
         Colors: (H,W,3) uint8 RGB, Depth: (H,W) float32 in meters.
@@ -135,11 +160,24 @@ class SLAMVisualizer:
         self.vis.poll_events()
         self.vis.update_renderer()
 
-        # Initialize visualizer viewpoint on the first frame
-        if self.frame_idx == 1:
-            view_ctl = self.vis.get_view_control()
-            if view_ctl is not None:
-                # Look from front-top-right towards the scene origin with +Y as UP
+        # Update viewpoint based on view mode
+        view_ctl = self.vis.get_view_control()
+        if view_ctl is not None:
+            if self.view_mode == "follow":
+                # Follow the camera pose (behind-the-shoulder view)
+                lookat = t_vis + R_vis[:, 2] * 0.5
+                front = -R_vis[:, 2]
+                up = -R_vis[:, 1]
+                view_ctl.set_lookat(lookat)
+                view_ctl.set_front(front)
+                view_ctl.set_up(up)
+            elif self.view_mode == "top":
+                # Top down orthogonal view
+                view_ctl.set_lookat(t_vis)
+                view_ctl.set_front([0.0, 1.0, 0.0])
+                view_ctl.set_up([0.0, 0.0, -1.0])
+            elif self.frame_idx == 1:
+                # Initialize visualizer viewpoint for free view on the first frame
                 view_ctl.set_front([0.5, 0.6, -0.6])
                 view_ctl.set_lookat([0.0, 0.2, 0.5])
                 view_ctl.set_up([0.0, 1.0, 0.0])
@@ -159,12 +197,43 @@ class SLAMVisualizer:
         # Add overlay text
         cv2.putText(hud, f"Surfels: {surfel_map.active_n}", (10, 30), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 102), 2)
+        # Z-Lock status and drift text
+        z_status = "ON" if self.z_lock else "OFF"
+        z_color = (102, 255, 0) if self.z_lock else (120, 120, 120)
+        cv2.putText(hud, f"Z Lock: {z_status} (Drift: {z_drift:+.3f}m)", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, z_color, 2)
+        
         cv2.putText(hud, "LIVE RGB", (10, height := self.height - 20), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         cv2.putText(hud, "DEPTH MAP (METERS)", (self.width + 10, height), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                     
-        cv2.imshow("RAM-SLAM Tracking HUD (ElasticFusion)", hud)
+        # Add bottom control panel for GUI buttons
+        panel_h = 60
+        panel = np.zeros((panel_h, self.width * 2, 3), dtype=np.uint8) + 40
+        
+        # Draw "Save & Exit" button
+        cv2.rectangle(panel, (10, 10), (200, 50), (45, 52, 254), -1) # Red button
+        cv2.putText(panel, "SAVE & EXIT", (40, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+        
+        # Draw "View Mode" button
+        view_colors = {
+            "free": (120, 120, 120),    # Gray
+            "follow": (102, 255, 0),    # Green
+            "top": (255, 153, 51)       # Blue
+        }
+        cv2.rectangle(panel, (220, 10), (450, 50), view_colors[self.view_mode], -1)
+        cv2.putText(panel, f"VIEW: {self.view_mode.upper()}", (245, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0) if self.view_mode == "follow" else (255, 255, 255), 2, cv2.LINE_AA)
+        
+        # Draw "Z Lock" button
+        z_lock_color = (102, 255, 0) if self.z_lock else (120, 120, 120)
+        cv2.rectangle(panel, (470, 10), (700, 50), z_lock_color, -1)
+        cv2.putText(panel, f"Z LOCK: {'ON' if self.z_lock else 'OFF'}", (505, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0) if self.z_lock else (255, 255, 255), 2, cv2.LINE_AA)
+        
+        # Stack panel under the main HUD image
+        hud_with_panel = np.vstack([hud, panel])
+        
+        cv2.imshow(self.hud_window_name, hud_with_panel)
         cv2.waitKey(1)
 
     def spin_once(self):

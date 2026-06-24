@@ -184,8 +184,16 @@ class SurfelMap:
                 self.ages[comp_s_idx] = frame_id
 
         # 4. Spawning new surfels
-        # Spawn if depth is valid and no surfel projected, or surfel was incompatible and behind the frame
+        # Spawn if depth is valid and no surfel projected, or surfel was incompatible
         spawn_mask = valid_depth & (~has_map_surfel)
+        
+        # If the projected surfel is incompatible, spawn a new surfel to capture this surface layer
+        if fuse_mask.any():
+            incompatible = ~compatible
+            if incompatible.any():
+                incompatible_pixels = torch.zeros_like(valid_depth)
+                incompatible_pixels[fuse_mask] = incompatible
+                spawn_mask = spawn_mask | incompatible_pixels
         
         # Add dynamic/behind spawn
         behind_mask = valid_depth & has_map_surfel

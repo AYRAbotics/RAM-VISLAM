@@ -63,6 +63,10 @@ class SlamNode(Node):
         
         self.declare_parameter('imu_model', 'imufusion')
         self.imu_model = self.get_parameter('imu_model').get_value()
+        self.declare_parameter('flat_ground', True)
+        self.flat_ground = self.get_parameter('flat_ground').get_value()
+        self.z_fixed = 0.0
+        self.z_fixed_initialized = False
         
         if self.imu_model == 'eskf':
             self.eskf = ESKF()
@@ -210,6 +214,7 @@ class SlamNode(Node):
         color_t = color_msg.header.stamp.sec * 1_000_000_000 + color_msg.header.stamp.nanosec
         depth_t = depth_msg.header.stamp.sec * 1_000_000_000 + depth_msg.header.stamp.nanosec
         frame_t = min(color_t, depth_t)
+        z_drift = 0.0
         
         frame_dt = 0.033
         if self.frame_count > 0 and self.last_frame_t is not None:
@@ -257,6 +262,17 @@ class SlamNode(Node):
         if self.frame_count == 0:
             self.T_wc = T_pred
             success = True
+            T_wi_init = self.T_wc @ self.T_i2c
+            self.z_fixed = T_wi_init[2, 3]
+            
+            flat_ground_active = self.flat_ground
+            if self.visualizer is not None:
+                flat_ground_active = self.visualizer.z_lock
+                
+            if flat_ground_active:
+                self.z_fixed_initialized = True
+                if hasattr(self.eskf, 'p'):
+                    self.eskf.p[2] = self.z_fixed
         else:
             # Compute predicted relative motion
             T_init_rel = np.linalg.inv(self.T_wc_prev) @ T_pred
@@ -295,20 +311,41 @@ class SlamNode(Node):
             T_wi = self.T_wc @ self.T_i2c
             
             # Scale measurement noise dynamically based on angular velocity to trust IMU during fast rotation
-            gyro_norm = np.linalg.norm(curr_gyr)
+            gyro_norm = np.linalg.norm(self.curr_gyr)
             rot_scale = 1.0 + 10.0 * gyro_norm
             # Keep pos_scale constant to let visual tracking correct accelerometer velocity drift!
             pos_scale = 1.0
             
             self.eskf.update(T_wi[0:3, 3], T_wi[0:3, 0:3], pos_noise_scale=pos_scale, rot_noise_scale=rot_scale, dt=frame_dt)
             
-            # Feed back the updated ESKF filtered pose to self.T_wc
-            T_wi_filt = np.eye(4)
+            # Feed back the updated ESKF filtered rotation to self.T_wc
             if hasattr(self.eskf, 'R'):
-                T_wi_filt[0:3, 0:3] = self.eskf.R.as_matrix()
+                self.T_wc[0:3, 0:3] = self.eskf.R.as_matrix() @ self.T_c2i[0:3, 0:3]
+            # Also update the ESKF internal position to match tracking to avoid accelerometer noise injection
             if hasattr(self.eskf, 'p'):
-                T_wi_filt[0:3, 3] = self.eskf.p
-            self.T_wc = T_wi_filt @ self.T_c2i
+                T_wi = self.T_wc @ self.T_i2c
+                self.eskf.p = T_wi[0:3, 3]
+            
+            # Apply flat ground height constraint to camera pose and ESKF state
+            flat_ground_active = self.flat_ground
+            if self.visualizer is not None:
+                flat_ground_active = self.visualizer.z_lock
+            
+            T_wi_curr = self.T_wc @ self.T_i2c
+            if flat_ground_active:
+                if not self.z_fixed_initialized:
+                    self.z_fixed = T_wi_curr[2, 3]
+                    self.z_fixed_initialized = True
+                z_drift = T_wi_curr[2, 3] - self.z_fixed
+                T_wi_curr[2, 3] = self.z_fixed
+                self.T_wc = T_wi_curr @ self.T_c2i
+                if hasattr(self.eskf, 'p'):
+                    self.eskf.p[2] = self.z_fixed
+                if hasattr(self.eskf, 'v'):
+                    self.eskf.v[2] = 0.0
+            else:
+                self.z_fixed_initialized = False
+                z_drift = T_wi_curr[2, 3] - self.z_fixed
             
             # Keyframe management
             is_kf = False
@@ -337,7 +374,7 @@ class SlamNode(Node):
                     self.surfel_map.prune_unstable(self.frame_count, min_weight=3.0)
                     
             if self.visualizer is not None:
-                self.visualizer.update(self.T_wc, self.surfel_map, color_rgb, depth_m)
+                self.visualizer.update(self.T_wc, self.surfel_map, color_rgb, depth_m, z_drift=z_drift)
 
             # Publish pose and downsampled cloud
             self.publish_data(color_msg.header.stamp)
