@@ -67,8 +67,8 @@ class SlamNode(Node):
         self.flat_ground = self.get_parameter('flat_ground').get_value()
         self.declare_parameter('imu_time_delay', 0.0)
         self.imu_time_delay = self.get_parameter('imu_time_delay').get_value()
-        self.declare_parameter('translation_damping', 100.0)
-        self.translation_damping = self.get_parameter('translation_damping').get_value()
+        self.declare_parameter('gyro_translation_damping', 30.0)
+        self.gyro_translation_damping = self.get_parameter('gyro_translation_damping').get_value()
         self.z_fixed = 0.0
         self.z_fixed_initialized = False
         
@@ -180,7 +180,7 @@ class SlamNode(Node):
         
         self.get_logger().info(f"SlamNode: Received CameraInfo. Intrinsics: fx={fx}, fy={fy}, cx={cx}, cy={cy}")
         
-        self.tracker = RGBDTracker(fx, fy, cx, cy, width=msg.width, height=msg.height, translation_damping=self.translation_damping)
+        self.tracker = RGBDTracker(fx, fy, cx, cy, width=msg.width, height=msg.height)
         
         # Create corresponding depth camera calibration using the correct depth camera intrinsics
         K_d = np.array([
@@ -290,6 +290,11 @@ class SlamNode(Node):
             )
             
             if success:
+                if self.gyro_translation_damping > 0.0:
+                    gyro_norm = np.linalg.norm(self.curr_gyr)
+                    damping_factor = np.exp(-self.gyro_translation_damping * gyro_norm)
+                    T_rel[0:3, 3] = T_rel[0:3, 3] * damping_factor
+
                 # Robust rejection: prevent translation-rotation ambiguity or catastrophic visual jumps
                 T_delta = np.linalg.inv(T_init_rel) @ T_rel
                 dt_norm = np.linalg.norm(T_delta[0:3, 3])
