@@ -168,11 +168,10 @@ class RGBDTracker:
             
             # Verify tracking fitness
             if icp_result.fitness > 0.30:
-                T_rel = np.linalg.inv(icp_result.transformation)
-                return True, T_rel
+                # Return target -> source transform by inverting the src -> tgt result
+                return True, np.linalg.inv(icp_result.transformation)
         except Exception:
             pass
 
         # If ICP fails, return success and target -> source camera motion
-        T_rel = np.linalg.inv(T_odom)
-        return success, T_rel
+        return success, np.linalg.inv(T_odom)

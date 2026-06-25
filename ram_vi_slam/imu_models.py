@@ -220,11 +220,6 @@ class IMUFusionEstimator:
         self.p = p_meas.copy()
         self.R = Rotation.from_matrix(R_meas)
         
-        # Feedback orientation correction back to internal imufusion AHRS state
-        q_scipy = self.R.as_quat()
-        q_imufusion = np.array([q_scipy[3], q_scipy[0], q_scipy[1], q_scipy[2]])
-        self.ahrs.quaternion = imufusion.Quaternion(q_imufusion)
-        
         # Estimate linear velocity from position delta (average frame time ~0.033s if dt not provided)
         dt_est = kwargs.get('dt', 0.033)
         if dt_est <= 0:

@@ -69,13 +69,11 @@ def main():
     parser.add_argument('--max_frames', type=int, default=999_999)
     parser.add_argument('--save_map', default='/home/rv/RAM_VI_SLAM/output/surfel_map.ply')
     parser.add_argument('--visualize', action='store_true', help='Show live visualizer (Pangolin replicate)')
-    parser.add_argument('--imu_model', default='complementary', choices=['eskf', 'complementary', 'const_vel', 'gyro_guided', 'imufusion'], help='IMU state estimation model')
+    parser.add_argument('--imu_model', default='imufusion', choices=['eskf', 'complementary', 'const_vel', 'gyro_guided', 'imufusion'], help='IMU state estimation model')
     parser.add_argument('--roll-offset', type=float, default=-3.5, help='Roll offset in degrees (X axis)')
     parser.add_argument('--pitch_offset', type=float, default=0.0, help='Camera-IMU pitch offset in degrees')
     parser.add_argument('--yaw_offset', type=float, default=0.0, help='Camera-IMU yaw offset in degrees')
     parser.add_argument('--flat_ground', action=argparse.BooleanOptionalAction, default=True, help='Enforce flat ground constraint (constant height) to eliminate vertical drift/noise')
-    parser.add_argument('--imu_time_delay', type=float, default=0.0, help='Time shift in seconds to apply to IMU timestamps (imu_t += delay) to compensate for camera latency')
-    parser.add_argument('--gyro_translation_damping', type=float, default=30.0, help='Damping coefficient based on gyroscope norm to suppress rotation-translation leakage in visual odometry during turns')
     args = parser.parse_args()
 
     print(f"OfflineRunner: Starting processing on {args.bag_path} using IMU model: {args.imu_model}")
@@ -190,12 +188,10 @@ def main():
         # Buffer IMU readings
         if topic == '/camera/camera/accel/sample':
             acc = np.array([msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z])
-            t_shifted = t_msg + int(args.imu_time_delay * 1e9)
-            imu_history.append((t_shifted, 'accel', acc))
+            imu_history.append((t_msg, 'accel', acc))
         elif topic == '/camera/camera/gyro/sample':
             gyr = np.array([msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z])
-            t_shifted = t_msg + int(args.imu_time_delay * 1e9)
-            imu_history.append((t_shifted, 'gyro', gyr))
+            imu_history.append((t_msg, 'gyro', gyr))
             
         # Buffer RGB & Depth
         elif topic == '/camera/camera/color/image_raw':
@@ -276,11 +272,6 @@ def main():
                     track_success, T_rel = tracker.align_frames(latest_color_prev, depth_m_prev, latest_color, depth_m, T_init_rel)
                     
                     if track_success:
-                        if args.gyro_translation_damping > 0.0:
-                            gyro_norm = np.linalg.norm(curr_gyr)
-                            damping_factor = np.exp(-args.gyro_translation_damping * gyro_norm)
-                            T_rel[0:3, 3] = T_rel[0:3, 3] * damping_factor
-
                         # Robust rejection: prevent translation-rotation ambiguity or catastrophic visual jumps
                         T_delta = np.linalg.inv(T_init_rel) @ T_rel
                         dt_norm = np.linalg.norm(T_delta[0:3, 3])

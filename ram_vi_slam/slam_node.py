@@ -61,14 +61,10 @@ class SlamNode(Node):
         self.pitch_off = self.get_parameter('camera_imu_pitch_offset').get_value()
         self.yaw_off = self.get_parameter('camera_imu_yaw_offset').get_value()
         
-        self.declare_parameter('imu_model', 'complementary')
+        self.declare_parameter('imu_model', 'imufusion')
         self.imu_model = self.get_parameter('imu_model').get_value()
         self.declare_parameter('flat_ground', True)
         self.flat_ground = self.get_parameter('flat_ground').get_value()
-        self.declare_parameter('imu_time_delay', 0.0)
-        self.imu_time_delay = self.get_parameter('imu_time_delay').get_value()
-        self.declare_parameter('gyro_translation_damping', 30.0)
-        self.gyro_translation_damping = self.get_parameter('gyro_translation_damping').get_value()
         self.z_fixed = 0.0
         self.z_fixed_initialized = False
         
@@ -202,14 +198,12 @@ class SlamNode(Node):
     def on_accel(self, msg):
         acc = np.array([msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z])
         t_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
-        t_shifted = t_ns + int(self.imu_time_delay * 1_000_000_000)
-        self.imu_history.append((t_shifted, 'accel', acc))
+        self.imu_history.append((t_ns, 'accel', acc))
 
     def on_gyro(self, msg):
         gyr = np.array([msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z])
         t_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
-        t_shifted = t_ns + int(self.imu_time_delay * 1_000_000_000)
-        self.imu_history.append((t_shifted, 'gyro', gyr))
+        self.imu_history.append((t_ns, 'gyro', gyr))
 
     def on_frame_pair(self, color_msg, depth_msg):
         """Fuses synchronized color and depth frames."""
@@ -290,11 +284,6 @@ class SlamNode(Node):
             )
             
             if success:
-                if self.gyro_translation_damping > 0.0:
-                    gyro_norm = np.linalg.norm(self.curr_gyr)
-                    damping_factor = np.exp(-self.gyro_translation_damping * gyro_norm)
-                    T_rel[0:3, 3] = T_rel[0:3, 3] * damping_factor
-
                 # Robust rejection: prevent translation-rotation ambiguity or catastrophic visual jumps
                 T_delta = np.linalg.inv(T_init_rel) @ T_rel
                 dt_norm = np.linalg.norm(T_delta[0:3, 3])
