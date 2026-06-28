@@ -1,6 +1,8 @@
 import numpy as np
 import torch
 import open3d as o3d
+from .diagnostics import metrics_logger
+from .surfel_importance import compute_importance
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -22,6 +24,22 @@ class SurfelMap:
         self.radii     = torch.zeros(max_surfels,      dtype=torch.float32, device=DEVICE)
         self.ages      = torch.zeros(max_surfels,      dtype=torch.int32,   device=DEVICE)
         self.kf_ids    = torch.zeros(max_surfels,      dtype=torch.int32,   device=DEVICE)
+        
+        # New GPU metadata buffers for Adaptive Surfel Importance Framework (Phase 1)
+        self.unique_surfel_id = torch.zeros(max_surfels, dtype=torch.int32, device=DEVICE)
+        self.creation_frame = torch.zeros(max_surfels, dtype=torch.int32, device=DEVICE)
+        self.last_observed_frame = torch.zeros(max_surfels, dtype=torch.int32, device=DEVICE)
+        self.observation_count = torch.zeros(max_surfels, dtype=torch.float32, device=DEVICE)
+        self.fusion_count = torch.zeros(max_surfels, dtype=torch.float32, device=DEVICE)
+        self.confidence_score = torch.zeros(max_surfels, dtype=torch.float32, device=DEVICE)
+        self.position_variance = torch.zeros(max_surfels, dtype=torch.float32, device=DEVICE)
+        self.normal_variance = torch.zeros(max_surfels, dtype=torch.float32, device=DEVICE)
+        self.average_depth_confidence = torch.zeros(max_surfels, dtype=torch.float32, device=DEVICE)
+        self.average_icp_fitness = torch.zeros(max_surfels, dtype=torch.float32, device=DEVICE)
+        self.average_viewing_angle = torch.zeros(max_surfels, dtype=torch.float32, device=DEVICE)
+        self.local_density = torch.zeros(max_surfels, dtype=torch.float32, device=DEVICE)
+        self.importance_score = torch.zeros(max_surfels, dtype=torch.float32, device=DEVICE)
+        self.total_spawned = 0
         
         self.active_n = 0
         
@@ -62,13 +80,82 @@ class SurfelMap:
         new_kf_ids[:self.active_n] = self.kf_ids[:self.active_n]
         self.kf_ids = new_kf_ids
         
+        new_unique_surfel_id = torch.zeros(new_max, dtype=torch.int32, device=DEVICE)
+        new_unique_surfel_id[:self.active_n] = self.unique_surfel_id[:self.active_n]
+        self.unique_surfel_id = new_unique_surfel_id
+        
+        new_creation_frame = torch.zeros(new_max, dtype=torch.int32, device=DEVICE)
+        new_creation_frame[:self.active_n] = self.creation_frame[:self.active_n]
+        self.creation_frame = new_creation_frame
+        
+        new_last_observed_frame = torch.zeros(new_max, dtype=torch.int32, device=DEVICE)
+        new_last_observed_frame[:self.active_n] = self.last_observed_frame[:self.active_n]
+        self.last_observed_frame = new_last_observed_frame
+        
+        new_observation_count = torch.zeros(new_max, dtype=torch.float32, device=DEVICE)
+        new_observation_count[:self.active_n] = self.observation_count[:self.active_n]
+        self.observation_count = new_observation_count
+        
+        new_fusion_count = torch.zeros(new_max, dtype=torch.float32, device=DEVICE)
+        new_fusion_count[:self.active_n] = self.fusion_count[:self.active_n]
+        self.fusion_count = new_fusion_count
+        
+        new_confidence_score = torch.zeros(new_max, dtype=torch.float32, device=DEVICE)
+        new_confidence_score[:self.active_n] = self.confidence_score[:self.active_n]
+        self.confidence_score = new_confidence_score
+        
+        new_position_variance = torch.zeros(new_max, dtype=torch.float32, device=DEVICE)
+        new_position_variance[:self.active_n] = self.position_variance[:self.active_n]
+        self.position_variance = new_position_variance
+        
+        new_normal_variance = torch.zeros(new_max, dtype=torch.float32, device=DEVICE)
+        new_normal_variance[:self.active_n] = self.normal_variance[:self.active_n]
+        self.normal_variance = new_normal_variance
+        
+        new_average_depth_confidence = torch.zeros(new_max, dtype=torch.float32, device=DEVICE)
+        new_average_depth_confidence[:self.active_n] = self.average_depth_confidence[:self.active_n]
+        self.average_depth_confidence = new_average_depth_confidence
+        
+        new_average_icp_fitness = torch.zeros(new_max, dtype=torch.float32, device=DEVICE)
+        new_average_icp_fitness[:self.active_n] = self.average_icp_fitness[:self.active_n]
+        self.average_icp_fitness = new_average_icp_fitness
+        
+        new_average_viewing_angle = torch.zeros(new_max, dtype=torch.float32, device=DEVICE)
+        new_average_viewing_angle[:self.active_n] = self.average_viewing_angle[:self.active_n]
+        self.average_viewing_angle = new_average_viewing_angle
+        
+        new_local_density = torch.zeros(new_max, dtype=torch.float32, device=DEVICE)
+        new_local_density[:self.active_n] = self.local_density[:self.active_n]
+        self.local_density = new_local_density
+        
+        new_importance_score = torch.zeros(new_max, dtype=torch.float32, device=DEVICE)
+        new_importance_score[:self.active_n] = self.importance_score[:self.active_n]
+        self.importance_score = new_importance_score
+        
         self.max_surfels = new_max
 
-    def fuse_frame(self, color_img, depth_aligned, T_wc, frame_id, kf_id):
+    def update_densities(self, radius=0.05):
+        if self.active_n == 0:
+            return
+        
+        # Vectorized voxel-based local density estimation
+        positions = self.positions[:self.active_n]
+        voxel_coords = torch.round(positions / radius).long()
+        
+        # Count occurrences of each voxel hash
+        unique_voxels, inverse_indices, counts = torch.unique(
+            voxel_coords, dim=0, return_inverse=True, return_counts=True
+        )
+        
+        # For each surfel, neighbors count = voxel count - 1
+        self.local_density[:self.active_n] = torch.clamp(counts[inverse_indices].float() - 1.0, min=0.0)
+
+    def fuse_frame(self, color_img, depth_aligned, T_wc, frame_id, kf_id, icp_fitness=None):
         """
         Fuses a new aligned RGB-D frame into the surfel map.
         T_wc: 4x4 homogenous camera-to-world transform.
         """
+        fused_n = 0
         # Transfer current frame to GPU
         color_t = torch.tensor(color_img, dtype=torch.float32, device=DEVICE) / 255.0  # (H, W, 3)
         depth_t = torch.tensor(depth_aligned, dtype=torch.float32, device=DEVICE)       # (H, W)
@@ -80,6 +167,16 @@ class SurfelMap:
         
         R_wc = torch.tensor(T_wc[0:3, 0:3], dtype=torch.float32, device=DEVICE)
         t_wc = torch.tensor(T_wc[0:3, 3], dtype=torch.float32, device=DEVICE)
+
+        # Get frame's ICP fitness from metrics_logger if not passed
+        if icp_fitness is None:
+            with metrics_logger.lock:
+                icp_fitness = metrics_logger.current_frame_metrics.get("icp_fitness", 1.0)
+        if icp_fitness is None:
+            icp_fitness = 1.0
+
+        # Compute depth confidence map
+        depth_conf_map = torch.exp(-0.25 * depth_t)
 
         # 1. Backproject frame to 3D camera frame and compute normals
         valid_depth = depth_t > 0.1
@@ -149,6 +246,7 @@ class SurfelMap:
         fuse_mask = valid_depth & has_map_surfel
         
         # Fusion compatibility check
+        comp_s_idx = torch.tensor([], dtype=torch.long, device=DEVICE)
         if fuse_mask.any():
             s_idx = index_map[fuse_mask]
             
@@ -164,13 +262,35 @@ class SurfelMap:
             
             compatible = (pos_diff < 0.05) & (nor_align > 0.75)
             
+            # Increment observation counts and update last observed frames for ALL observed surfels
+            observed_s_idx = s_idx
+            if len(observed_s_idx) > 0:
+                self.observation_count[observed_s_idx] += 1.0
+                self.last_observed_frame[observed_s_idx] = frame_id
+            
             if compatible.any():
+                fused_n = torch.sum(compatible).item()
                 comp_s_idx = s_idx[compatible]
                 comp_f_pos = f_pos[compatible]
                 comp_f_nor = f_nor[compatible]
                 comp_f_col = color_t[fuse_mask][compatible]
+                comp_f_depth_conf = depth_conf_map[fuse_mask][compatible]
                 
-                # Perform weighted update
+                # Increment fusion counts
+                self.fusion_count[comp_s_idx] += 1.0
+                
+                # Compute viewing angle for compatible points
+                surf_to_cam = t_wc.unsqueeze(0) - comp_f_pos
+                surf_to_cam_norm = torch.norm(surf_to_cam, dim=-1, keepdim=True)
+                v = surf_to_cam / (surf_to_cam_norm + 1e-6)
+                cos_angle = torch.sum(comp_f_nor * v, dim=-1)
+                comp_f_view_angle = torch.acos(torch.clamp(cos_angle, -1.0, 1.0))
+                
+                # Calculate differences with old means for variance tracking
+                diff_pos_old = comp_f_pos - self.positions[comp_s_idx]
+                diff_nor_old = comp_f_nor - self.normals[comp_s_idx]
+                
+                # Perform weighted update of nominal attributes
                 w_old = self.weights[comp_s_idx]
                 w_new = w_old + 1.0
                 
@@ -178,6 +298,27 @@ class SurfelMap:
                 
                 new_nor = (self.normals[comp_s_idx] * w_old.unsqueeze(-1) + comp_f_nor) / w_new.unsqueeze(-1)
                 self.normals[comp_s_idx] = new_nor / torch.norm(new_nor, dim=-1, keepdim=True)
+                
+                # Calculate differences with new means
+                diff_pos_new = comp_f_pos - self.positions[comp_s_idx]
+                diff_nor_new = comp_f_nor - self.normals[comp_s_idx]
+                
+                # Update running variances using Welford's formula
+                m2_pos_old = self.position_variance[comp_s_idx] * w_old
+                m2_pos_new = m2_pos_old + torch.sum(diff_pos_old * diff_pos_new, dim=-1)
+                self.position_variance[comp_s_idx] = m2_pos_new / w_new
+                
+                m2_nor_old = self.normal_variance[comp_s_idx] * w_old
+                m2_nor_new = m2_nor_old + torch.sum(diff_nor_old * diff_nor_new, dim=-1)
+                self.normal_variance[comp_s_idx] = m2_nor_new / w_new
+                
+                # Update running averages
+                self.average_depth_confidence[comp_s_idx] = (self.average_depth_confidence[comp_s_idx] * w_old + comp_f_depth_conf) / w_new
+                self.average_icp_fitness[comp_s_idx] = (self.average_icp_fitness[comp_s_idx] * w_old + icp_fitness) / w_new
+                self.average_viewing_angle[comp_s_idx] = (self.average_viewing_angle[comp_s_idx] * w_old + comp_f_view_angle) / w_new
+                
+                # Update confidence_score field
+                self.confidence_score[comp_s_idx] = self.average_depth_confidence[comp_s_idx] * (1.0 - torch.exp(-0.1 * self.observation_count[comp_s_idx]))
                 
                 self.colors[comp_s_idx] = (self.colors[comp_s_idx] * w_old.unsqueeze(-1) + comp_f_col) / w_new.unsqueeze(-1)
                 self.weights[comp_s_idx] = w_new
@@ -217,7 +358,67 @@ class SurfelMap:
             self.radii[new_s_indices]     = 0.01 + 0.01 * (pts_cam[spawn_mask, 2] / 4.0)
             self.ages[new_s_indices]      = frame_id
             self.kf_ids[new_s_indices]    = kf_id
+            
+            # Spawn metadata initialization
+            self.unique_surfel_id[new_s_indices] = torch.arange(self.total_spawned, self.total_spawned + spawn_n, dtype=torch.int32, device=DEVICE)
+            self.total_spawned += spawn_n
+            
+            self.creation_frame[new_s_indices] = frame_id
+            self.last_observed_frame[new_s_indices] = frame_id
+            self.observation_count[new_s_indices] = 1.0
+            self.fusion_count[new_s_indices] = 0.0
+            
+            spawn_depth_conf = depth_conf_map[spawn_mask]
+            self.confidence_score[new_s_indices] = spawn_depth_conf
+            self.position_variance[new_s_indices] = 0.0
+            self.normal_variance[new_s_indices] = 0.0
+            self.average_depth_confidence[new_s_indices] = spawn_depth_conf
+            self.average_icp_fitness[new_s_indices] = icp_fitness
+            
+            # Compute initial viewing angle for spawned surfels
+            s_pts = pts_world[spawn_mask]
+            s_nor = normals_world[spawn_mask]
+            s_surf_to_cam = t_wc.unsqueeze(0) - s_pts
+            s_surf_to_cam_norm = torch.norm(s_surf_to_cam, dim=-1, keepdim=True)
+            s_v = s_surf_to_cam / (s_surf_to_cam_norm + 1e-6)
+            s_cos_angle = torch.sum(s_nor * s_v, dim=-1)
+            self.average_viewing_angle[new_s_indices] = torch.acos(torch.clamp(s_cos_angle, -1.0, 1.0))
+            
+            self.local_density[new_s_indices] = 0.0
+            self.importance_score[new_s_indices] = 0.0
+            
             self.active_n += spawn_n
+            
+        # 5. Local density estimation and importance score updates
+        self.update_densities(radius=0.05)
+        self.importance_score[:self.active_n] = compute_importance(self, current_frame_id=frame_id)
+            
+        metrics_logger.log("spawned_surfels", spawn_n)
+        metrics_logger.log("fused_surfels", fused_n)
+        metrics_logger.log("active_surfels", self.active_n)
+        
+        # 6. Log diagnostics metrics
+        if self.active_n > 0:
+            importances = self.importance_score[:self.active_n]
+            obs_counts = self.observation_count[:self.active_n]
+            fus_counts = self.fusion_count[:self.active_n]
+            densities = self.local_density[:self.active_n]
+            
+            metrics_logger.log("mean_importance", float(torch.mean(importances).item()))
+            metrics_logger.log("median_importance", float(torch.median(importances).item()))
+            metrics_logger.log("max_importance", float(torch.max(importances).item()))
+            metrics_logger.log("min_importance", float(torch.min(importances).item()))
+            metrics_logger.log("avg_observation_count", float(torch.mean(obs_counts).item()))
+            metrics_logger.log("avg_fusion_count", float(torch.mean(fus_counts).item()))
+            metrics_logger.log("avg_local_density", float(torch.mean(densities).item()))
+        else:
+            metrics_logger.log("mean_importance", 0.0)
+            metrics_logger.log("median_importance", 0.0)
+            metrics_logger.log("max_importance", 0.0)
+            metrics_logger.log("min_importance", 0.0)
+            metrics_logger.log("avg_observation_count", 0.0)
+            metrics_logger.log("avg_fusion_count", 0.0)
+            metrics_logger.log("avg_local_density", 0.0)
 
     def prune_unstable(self, current_frame_id, min_weight=3.0):
         """Remove unstable surfels (e.g., low weight and aged)."""
@@ -237,7 +438,26 @@ class SurfelMap:
             self.radii[:keep_n]     = self.radii[:self.active_n][keep]
             self.ages[:keep_n]      = self.ages[:self.active_n][keep]
             self.kf_ids[:keep_n]    = self.kf_ids[:self.active_n][keep]
+            
+            # Prune custom metadata fields
+            self.unique_surfel_id[:keep_n] = self.unique_surfel_id[:self.active_n][keep]
+            self.creation_frame[:keep_n] = self.creation_frame[:self.active_n][keep]
+            self.last_observed_frame[:keep_n] = self.last_observed_frame[:self.active_n][keep]
+            self.observation_count[:keep_n] = self.observation_count[:self.active_n][keep]
+            self.fusion_count[:keep_n] = self.fusion_count[:self.active_n][keep]
+            self.confidence_score[:keep_n] = self.confidence_score[:self.active_n][keep]
+            self.position_variance[:keep_n] = self.position_variance[:self.active_n][keep]
+            self.normal_variance[:keep_n] = self.normal_variance[:self.active_n][keep]
+            self.average_depth_confidence[:keep_n] = self.average_depth_confidence[:self.active_n][keep]
+            self.average_icp_fitness[:keep_n] = self.average_icp_fitness[:self.active_n][keep]
+            self.average_viewing_angle[:keep_n] = self.average_viewing_angle[:self.active_n][keep]
+            self.local_density[:keep_n] = self.local_density[:self.active_n][keep]
+            self.importance_score[:keep_n] = self.importance_score[:self.active_n][keep]
+            
+            metrics_logger.log("pruned_surfels", self.active_n - keep_n)
             self.active_n = keep_n
+        else:
+            metrics_logger.log("pruned_surfels", 0)
 
     def merge_voxels(self, voxel_size=0.015):
         """Vectorized spatial hash voxel grid filtering to merge duplicate surfels."""
@@ -284,6 +504,47 @@ class SurfelMap:
         new_ages.scatter_reduce_(0, inverse_indices, self.ages[:self.active_n], reduce='amax', include_self=False)
         new_kf_ids.scatter_reduce_(0, inverse_indices, self.kf_ids[:self.active_n], reduce='amax', include_self=False)
         
+        # Merge custom metadata fields
+        new_unique_surfel_id = torch.zeros(keep_n, dtype=torch.int32, device=DEVICE)
+        new_creation_frame = torch.zeros(keep_n, dtype=torch.int32, device=DEVICE)
+        new_last_observed_frame = torch.zeros(keep_n, dtype=torch.int32, device=DEVICE)
+        new_observation_count = torch.zeros(keep_n, dtype=torch.float32, device=DEVICE)
+        new_fusion_count = torch.zeros(keep_n, dtype=torch.float32, device=DEVICE)
+        new_confidence_score = torch.zeros(keep_n, dtype=torch.float32, device=DEVICE)
+        new_position_variance = torch.zeros(keep_n, dtype=torch.float32, device=DEVICE)
+        new_normal_variance = torch.zeros(keep_n, dtype=torch.float32, device=DEVICE)
+        new_average_depth_confidence = torch.zeros(keep_n, dtype=torch.float32, device=DEVICE)
+        new_average_icp_fitness = torch.zeros(keep_n, dtype=torch.float32, device=DEVICE)
+        new_average_viewing_angle = torch.zeros(keep_n, dtype=torch.float32, device=DEVICE)
+        new_local_density = torch.zeros(keep_n, dtype=torch.float32, device=DEVICE)
+        new_importance_score = torch.zeros(keep_n, dtype=torch.float32, device=DEVICE)
+
+        # Merge ID and frames using reduction
+        new_unique_surfel_id.scatter_reduce_(0, inverse_indices, self.unique_surfel_id[:self.active_n], reduce='amax', include_self=False)
+        new_creation_frame.scatter_reduce_(0, inverse_indices, self.creation_frame[:self.active_n], reduce='amin', include_self=False)
+        new_last_observed_frame.scatter_reduce_(0, inverse_indices, self.last_observed_frame[:self.active_n], reduce='amax', include_self=False)
+        
+        # Sum counts
+        new_observation_count.scatter_add_(0, inverse_indices, self.observation_count[:self.active_n])
+        new_fusion_count.scatter_add_(0, inverse_indices, self.fusion_count[:self.active_n])
+        
+        # Weighted averages for stats
+        new_confidence_score.scatter_add_(0, inverse_indices, self.confidence_score[:self.active_n] * w)
+        new_average_depth_confidence.scatter_add_(0, inverse_indices, self.average_depth_confidence[:self.active_n] * w)
+        new_average_icp_fitness.scatter_add_(0, inverse_indices, self.average_icp_fitness[:self.active_n] * w)
+        new_average_viewing_angle.scatter_add_(0, inverse_indices, self.average_viewing_angle[:self.active_n] * w)
+        
+        new_confidence_score[valid_w] /= new_weights[valid_w]
+        new_average_depth_confidence[valid_w] /= new_weights[valid_w]
+        new_average_icp_fitness[valid_w] /= new_weights[valid_w]
+        new_average_viewing_angle[valid_w] /= new_weights[valid_w]
+        
+        # Variances and other metrics
+        new_position_variance.scatter_reduce_(0, inverse_indices, self.position_variance[:self.active_n], reduce='amax', include_self=False)
+        new_normal_variance.scatter_reduce_(0, inverse_indices, self.normal_variance[:self.active_n], reduce='amax', include_self=False)
+        new_local_density.scatter_reduce_(0, inverse_indices, self.local_density[:self.active_n], reduce='amax', include_self=False)
+        new_importance_score.scatter_reduce_(0, inverse_indices, self.importance_score[:self.active_n], reduce='amax', include_self=False)
+        
         # Overwrite buffers
         self.positions[:keep_n] = new_positions
         self.normals[:keep_n]   = new_normals
@@ -292,6 +553,20 @@ class SurfelMap:
         self.radii[:keep_n]     = new_radii
         self.ages[:keep_n]      = new_ages
         self.kf_ids[:keep_n]    = new_kf_ids
+        
+        self.unique_surfel_id[:keep_n] = new_unique_surfel_id
+        self.creation_frame[:keep_n] = new_creation_frame
+        self.last_observed_frame[:keep_n] = new_last_observed_frame
+        self.observation_count[:keep_n] = new_observation_count
+        self.fusion_count[:keep_n] = new_fusion_count
+        self.confidence_score[:keep_n] = new_confidence_score
+        self.position_variance[:keep_n] = new_position_variance
+        self.normal_variance[:keep_n] = new_normal_variance
+        self.average_depth_confidence[:keep_n] = new_average_depth_confidence
+        self.average_icp_fitness[:keep_n] = new_average_icp_fitness
+        self.average_viewing_angle[:keep_n] = new_average_viewing_angle
+        self.local_density[:keep_n] = new_local_density
+        self.importance_score[:keep_n] = new_importance_score
         
         self.active_n = keep_n
 

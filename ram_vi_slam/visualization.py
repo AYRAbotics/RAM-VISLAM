@@ -119,7 +119,24 @@ class SLAMVisualizer:
             
             with torch.no_grad():
                 pos = surfel_map.positions[:surfel_map.active_n:step].cpu().numpy()
-                col = surfel_map.colors[:surfel_map.active_n:step].cpu().numpy()
+                imp = surfel_map.importance_score[:surfel_map.active_n:step]
+                
+                # Dynamic visualizer coloring based on importance score
+                vis_col = torch.zeros((len(imp), 3), dtype=torch.float32, device=imp.device)
+                
+                # Importance 0.8 to 1.0 -> Green [0.0, 1.0, 0.0]
+                green_mask = imp >= 0.8
+                vis_col[green_mask] = torch.tensor([0.0, 1.0, 0.0], device=imp.device)
+                
+                # Importance 0.5 to 0.8 -> Yellow [1.0, 1.0, 0.0]
+                yellow_mask = (imp >= 0.5) & (imp < 0.8)
+                vis_col[yellow_mask] = torch.tensor([1.0, 1.0, 0.0], device=imp.device)
+                
+                # Importance 0.0 to 0.5 -> Red [1.0, 0.0, 0.0]
+                red_mask = imp < 0.5
+                vis_col[red_mask] = torch.tensor([1.0, 0.0, 0.0], device=imp.device)
+                
+                col = vis_col.cpu().numpy()
                 
             # Apply world-to-visualizer rotation to map coordinates
             pos_vis = pos @ self.R_w2v.T
