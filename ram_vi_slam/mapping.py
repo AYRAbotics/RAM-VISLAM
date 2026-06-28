@@ -369,7 +369,7 @@ class SurfelMap:
             self.fusion_count[new_s_indices] = 0.0
             
             spawn_depth_conf = depth_conf_map[spawn_mask]
-            self.confidence_score[new_s_indices] = spawn_depth_conf
+            self.confidence_score[new_s_indices] = spawn_depth_conf * 0.09516258
             self.position_variance[new_s_indices] = 0.0
             self.normal_variance[new_s_indices] = 0.0
             self.average_depth_confidence[new_s_indices] = spawn_depth_conf
