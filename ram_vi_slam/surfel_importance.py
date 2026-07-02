@@ -35,7 +35,7 @@ def _compute_importance_scalar(surfel, current_frame_id):
     last_obs = int(get_val(surfel, 'last_observed_frame', 0))
     
     # 1. Observation Score
-    obs_score = 1.0 - np.exp(-0.05 * obs_count)
+    obs_score = 1.0 - np.exp(-0.1 * obs_count)
     
     # 2. Fusion Score
     fus_score = 1.0 - np.exp(-0.1 * fus_count)
@@ -50,7 +50,7 @@ def _compute_importance_scalar(surfel, current_frame_id):
     stability = np.exp(-1000.0 * pos_var - 10.0 * nor_var)
     
     # 7. Viewing Diversity: combines observation count with viewing angle
-    view_div = min(1.0, view_ang / 1.5708) * (1.0 - np.exp(-0.05 * obs_count))
+    view_div = min(1.0, view_ang / 1.5708) * (1.0 - np.exp(-0.1 * obs_count))
     
     # Weighted sum
     raw_score = (0.30 * obs_score + 
@@ -65,7 +65,7 @@ def _compute_importance_scalar(surfel, current_frame_id):
     penalty = 0.0
     if current_frame_id is not None:
         idle_time = max(0, current_frame_id - last_obs)
-        penalty += 0.002 * max(0.0, idle_time - 50.0)
+        penalty += min(0.25, 0.0005 * max(0.0, idle_time - 50.0))
         
     penalty += 5.0 * pos_var
     penalty += 1.0 * nor_var
@@ -98,11 +98,11 @@ def _compute_importance_tensor(surfel_map, current_frame_id):
         last_obs = surfel_map['last_observed_frame']
         
     # Vectorized calculations in PyTorch
-    obs_score = 1.0 - torch.exp(-0.05 * obs_count)
+    obs_score = 1.0 - torch.exp(-0.1 * obs_count)
     fus_score = 1.0 - torch.exp(-0.1 * fus_count)
     
     stability = torch.exp(-1000.0 * pos_var - 10.0 * nor_var)
-    view_div = torch.clamp(view_ang / 1.5708, max=1.0) * (1.0 - torch.exp(-0.05 * obs_count))
+    view_div = torch.clamp(view_ang / 1.5708, max=1.0) * (1.0 - torch.exp(-0.1 * obs_count))
     
     raw_score = (0.30 * obs_score + 
                  0.20 * fus_score + 
@@ -115,7 +115,7 @@ def _compute_importance_tensor(surfel_map, current_frame_id):
     penalty = torch.zeros_like(raw_score)
     if current_frame_id is not None:
         idle_time = torch.clamp(current_frame_id - last_obs, min=0)
-        penalty += 0.002 * torch.clamp(idle_time - 50.0, min=0.0)
+        penalty += torch.clamp(0.0005 * torch.clamp(idle_time - 50.0, min=0.0), max=0.25)
         
     penalty += 5.0 * pos_var
     penalty += 1.0 * nor_var

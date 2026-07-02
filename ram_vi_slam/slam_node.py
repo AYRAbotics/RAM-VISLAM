@@ -13,6 +13,8 @@ from nav_msgs.msg import Path
 from std_msgs.msg import Header
 import sensor_msgs_py.point_cloud2 as pc2
 from scipy.spatial.transform import Rotation
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -23,6 +25,7 @@ from .tracking import RGBDTracker
 from .mapping import SurfelMap
 from .loop_closure import LoopDetector
 from .pgo import PoseGraphOptimizer
+from .diagnostics import metrics_logger
 
 # Extrinsics matrices (same as bag calibration values)
 R_D2C = np.array([
@@ -65,8 +68,12 @@ class SlamNode(Node):
         self.imu_model = self.get_parameter('imu_model').get_value()
         self.declare_parameter('flat_ground', True)
         self.flat_ground = self.get_parameter('flat_ground').get_value()
+        self.declare_parameter('enable_diagnostics', False)
+        self.enable_diagnostics = self.get_parameter('enable_diagnostics').get_value()
         self.z_fixed = 0.0
         self.z_fixed_initialized = False
+        
+        metrics_logger.configure(enabled=self.enable_diagnostics)
         
         if self.imu_model == 'eskf':
             self.eskf = ESKF()
@@ -214,6 +221,7 @@ class SlamNode(Node):
         color_t = color_msg.header.stamp.sec * 1_000_000_000 + color_msg.header.stamp.nanosec
         depth_t = depth_msg.header.stamp.sec * 1_000_000_000 + depth_msg.header.stamp.nanosec
         frame_t = min(color_t, depth_t)
+        metrics_logger.start_frame(self.frame_count, float(frame_t) * 1e-9)
         z_drift = 0.0
         
         frame_dt = 0.033
@@ -231,18 +239,36 @@ class SlamNode(Node):
         # 1. Propagate ESKF to the current frame timestamp
         self.imu_history.sort(key=lambda x: x[0])
         
+        accel_samples = []
+        gyro_samples = []
+        t_start_imu = time.perf_counter()
         for imu_t, imu_type, imu_val in self.imu_history:
             if imu_t < frame_t:
                 if imu_type == 'accel':
                     self.curr_acc = imu_val
+                    accel_samples.append(imu_val)
                 elif imu_type == 'gyro':
                     self.curr_gyr = imu_val
+                    gyro_samples.append(imu_val)
                 
                 if self.last_imu_t is not None:
                     dt = (imu_t - self.last_imu_t) * 1e-9
                     if dt > 0:
                         self.eskf.predict(dt, self.curr_acc, self.curr_gyr)
                 self.last_imu_t = imu_t
+        t_imu_prop = time.perf_counter() - t_start_imu
+        metrics_logger.log("imu_propagation_time", t_imu_prop)
+        
+        if len(accel_samples) > 0:
+            accel_vars = np.var(accel_samples, axis=0)
+            metrics_logger.log("accel_var_x", float(accel_vars[0]))
+            metrics_logger.log("accel_var_y", float(accel_vars[1]))
+            metrics_logger.log("accel_var_z", float(accel_vars[2]))
+        if len(gyro_samples) > 0:
+            gyro_vars = np.var(gyro_samples, axis=0)
+            metrics_logger.log("gyro_var_x", float(gyro_vars[0]))
+            metrics_logger.log("gyro_var_y", float(gyro_vars[1]))
+            metrics_logger.log("gyro_var_z", float(gyro_vars[2]))
                 
         self.imu_history = [x for x in self.imu_history if x[0] >= frame_t]
 
@@ -257,6 +283,9 @@ class SlamNode(Node):
 
         # 3. GPU Depth Registration
         depth_m = self.tracker.register_depth(depth_np)
+        metrics_logger.log("image_width", color_rgb.shape[1])
+        metrics_logger.log("image_height", color_rgb.shape[0])
+        metrics_logger.log("valid_depth_pct", float(np.mean(depth_m > 0.1) * 100.0) if depth_m is not None else 0.0)
 
         # 4. Tracker Alignment
         if self.frame_count == 0:
@@ -358,20 +387,26 @@ class SlamNode(Node):
                 if t_dist > 0.08 or r_dist > 0.08:
                     is_kf = True
                     
+            metrics_logger.log("kf_inserted", is_kf)
             if is_kf:
                 kf_id = self.kf_count
                 self.kf_count += 1
                 self.last_kf_pose = self.T_wc.copy()
+                metrics_logger.log("kf_id", kf_id)
                 
                 # Push keyframe to background worker thread queue for place recognition
                 self.loop_queue.put((kf_id, color_rgb.copy(), depth_m.copy(), self.T_wc.copy()))
 
             # 5. Fuse frame into global surfel map
+            t_start_mapping = time.perf_counter()
             with self.map_lock:
                 self.surfel_map.fuse_frame(color_rgb, depth_m, self.T_wc, self.frame_count, self.kf_count - 1)
                 
                 if self.frame_count % 30 == 0:
                     self.surfel_map.prune_unstable(self.frame_count, min_weight=3.0)
+                    torch.cuda.empty_cache()
+            t_mapping_time = time.perf_counter() - t_start_mapping
+            metrics_logger.log("mapping_time", t_mapping_time)
                     
             if self.visualizer is not None:
                 self.visualizer.update(self.T_wc, self.surfel_map, color_rgb, depth_m, z_drift=z_drift)
@@ -379,6 +414,7 @@ class SlamNode(Node):
             # Publish pose and downsampled cloud
             self.publish_data(color_msg.header.stamp)
 
+        metrics_logger.end_frame()
         self.latest_color_prev = color_rgb.copy()
         self.depth_m_prev = depth_m.copy()
         self.T_wc_prev = self.T_wc.copy()
@@ -402,7 +438,9 @@ class SlamNode(Node):
                     self.pgo.add_loop_factor(cand_kf_id, kf_id, T_cand_curr)
                     
                     # Run pose graph optimization
+                    t_start_pgo = time.perf_counter()
                     optimized_poses = self.pgo.optimize()
+                    metrics_logger.log("pgo_time", time.perf_counter() - t_start_pgo)
                     
                     # Deform global map safely using lock
                     with self.map_lock:
@@ -492,6 +530,7 @@ class SlamNode(Node):
             self.cloud_pub.publish(cloud_msg)
 
     def destroy_node(self):
+        metrics_logger.save_and_close()
         if self.visualizer is not None:
             self.visualizer.destroy()
         super().destroy_node()

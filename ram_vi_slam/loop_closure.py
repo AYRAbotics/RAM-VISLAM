@@ -5,6 +5,7 @@ import torchvision.transforms as T
 from PIL import Image
 import faiss
 import open3d as o3d
+from .diagnostics import metrics_logger
 
 class DINOv2Extractor:
     def __init__(self):
@@ -69,6 +70,10 @@ class LoopDetector:
 
     def detect_loop(self, kf_id, color_img_rgb, depth_aligned, T_wc):
         """Query index for loop closure candidates and verify geometrically using ICP."""
+        metrics_logger.log("loop_candidate_found", False)
+        metrics_logger.log("loop_accepted", False)
+        metrics_logger.log("loop_similarity", None)
+
         if len(self.kf_list) < self.min_id_diff:
             return None
             
@@ -96,6 +101,9 @@ class LoopDetector:
             if sim < self.sim_threshold:
                 continue
                 
+            metrics_logger.log("loop_candidate_found", True)
+            metrics_logger.log("loop_similarity", float(sim))
+            
             # Run geometric verification using Open3D Point-to-Plane ICP
             print(f"LoopDetector: Candidate loop found between KF {kf_id} and KF {candidate_kf_id} (sim: {sim:.4f})")
             
@@ -143,6 +151,7 @@ class LoopDetector:
                 # Check verification criteria
                 if icp_res.fitness > 0.45 and icp_res.inlier_rmse < 0.035:
                     print(f"LoopDetector: Loop verified! ICP fitness: {icp_res.fitness:.4f}, RMSE: {icp_res.inlier_rmse:.4f}")
+                    metrics_logger.log("loop_accepted", True)
                     # Return current -> candidate transform by inverting the src -> tgt result
                     return candidate_kf_id, np.linalg.inv(icp_res.transformation)
             except Exception as e:

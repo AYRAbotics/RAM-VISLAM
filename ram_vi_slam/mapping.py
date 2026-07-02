@@ -138,13 +138,18 @@ class SurfelMap:
         if self.active_n == 0:
             return
         
-        # Vectorized voxel-based local density estimation
+        # Vectorized voxel-based local density estimation (optimized 1D packed hashes to prevent CUDA OOM)
         positions = self.positions[:self.active_n]
-        voxel_coords = torch.round(positions / radius).long()
         
-        # Count occurrences of each voxel hash
-        unique_voxels, inverse_indices, counts = torch.unique(
-            voxel_coords, dim=0, return_inverse=True, return_counts=True
+        # Shift and clamp to [0, 32767] (representing +/- 800m range at 0.05m radius)
+        voxel_coords = torch.clamp(torch.round(positions / radius).long() + 16384, 0, 32767)
+        
+        # Pack x, y, z into a single int64 hash key
+        packed_hash = (voxel_coords[:, 0] << 30) | (voxel_coords[:, 1] << 15) | voxel_coords[:, 2]
+        
+        # Count occurrences of each voxel hash using fast 1D unique
+        unique_hashes, inverse_indices, counts = torch.unique(
+            packed_hash, return_inverse=True, return_counts=True
         )
         
         # For each surfel, neighbors count = voxel count - 1
@@ -369,7 +374,7 @@ class SurfelMap:
             self.fusion_count[new_s_indices] = 0.0
             
             spawn_depth_conf = depth_conf_map[spawn_mask]
-            self.confidence_score[new_s_indices] = spawn_depth_conf * 0.09516258
+            self.confidence_score[new_s_indices] = spawn_depth_conf
             self.position_variance[new_s_indices] = 0.0
             self.normal_variance[new_s_indices] = 0.0
             self.average_depth_confidence[new_s_indices] = spawn_depth_conf
@@ -390,8 +395,11 @@ class SurfelMap:
             self.active_n += spawn_n
             
         # 5. Local density estimation and importance score updates
-        self.update_densities(radius=0.05)
-        self.importance_score[:self.active_n] = compute_importance(self, current_frame_id=frame_id)
+        if frame_id % 10 == 0 or self.active_n < 500_000:
+            if self.active_n > 5_000_000:
+                torch.cuda.empty_cache()
+            self.update_densities(radius=0.05)
+            self.importance_score[:self.active_n] = compute_importance(self, current_frame_id=frame_id)
             
         metrics_logger.log("spawned_surfels", spawn_n)
         metrics_logger.log("fused_surfels", fused_n)
@@ -464,12 +472,14 @@ class SurfelMap:
         if self.active_n == 0:
             return
         
-        # Round positions to find voxel coordinates
-        voxel_coords = torch.round(self.positions[:self.active_n] / voxel_size).long()
+        # Round and pack positions to find voxel coordinates safely
+        # Map center is shifted to 16384; coords are clamped to [0, 32767] (representing +/- 163m range at 1cm resolution)
+        voxel_coords = torch.clamp(torch.round(self.positions[:self.active_n] / voxel_size).long() + 16384, 0, 32767)
+        packed_hash = (voxel_coords[:, 0] << 30) | (voxel_coords[:, 1] << 15) | voxel_coords[:, 2]
         
-        # Unique voxels and mapping
-        unique_voxels, inverse_indices = torch.unique(voxel_coords, dim=0, return_inverse=True)
-        keep_n = len(unique_voxels)
+        # Unique 1D hash and mapping
+        unique_hashes, inverse_indices = torch.unique(packed_hash, return_inverse=True)
+        keep_n = len(unique_hashes)
         
         if keep_n == self.active_n:
             return  # No duplicates to merge

@@ -2,6 +2,10 @@ import argparse
 import time
 import os
 import sys
+
+# Pre-configure PyTorch allocator conf to reduce fragmentation and avoid GPU OOM
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import signal
 import cv2
 import numpy as np
@@ -20,6 +24,44 @@ from .tracking import RGBDTracker
 from .mapping import SurfelMap
 from .loop_closure import LoopDetector
 from .pgo import PoseGraphOptimizer
+from .diagnostics import metrics_logger
+import atexit
+
+_global_state = {
+    'surfel_map': None,
+    'save_map_path': '/home/rv/RAM_VI_SLAM/output/surfel_map.ply',
+    'bag_path': 'slam_benchmark_run1',
+    'frame_count': 0,
+    'saved': False
+}
+
+def cleanup_and_save_map():
+    if _global_state.get('saved', False):
+        return
+    surfel_map = _global_state['surfel_map']
+    if surfel_map is not None and surfel_map.active_n > 0:
+        print(f"\n[Emergency Save] Exiting runner. Saving current map of {surfel_map.active_n} surfels to prevent data loss...", flush=True)
+        try:
+            surfel_map.prune_unstable(_global_state['frame_count'], min_weight=3.0)
+            surfel_map.merge_voxels(voxel_size=0.01)
+            
+            save_path = _global_state['save_map_path']
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            surfel_map.export_ply(save_path)
+            
+            # Save unique timestamped map
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            bag_name = os.path.basename(os.path.normpath(_global_state.get('bag_path', 'slam_benchmark_run1')))
+            unique_save_path = f'/home/rv/RAM_VI_SLAM/output/map_{bag_name}_{timestamp}.ply'
+            surfel_map.export_ply(unique_save_path)
+            
+            _global_state['saved'] = True
+            print(f"[Emergency Save] Maps saved successfully to {save_path} and {unique_save_path}", flush=True)
+        except Exception as save_err:
+            print(f"[Emergency Save] Failed to save map: {save_err}", flush=True)
+
+atexit.register(cleanup_and_save_map)
 
 # Calibration constants from bag inspection
 FX_C = 610.1809082;  FY_C = 610.26391602
@@ -74,7 +116,10 @@ def main():
     parser.add_argument('--pitch_offset', type=float, default=0.0, help='Camera-IMU pitch offset in degrees')
     parser.add_argument('--yaw_offset', type=float, default=0.0, help='Camera-IMU yaw offset in degrees')
     parser.add_argument('--flat_ground', action=argparse.BooleanOptionalAction, default=True, help='Enforce flat ground constraint (constant height) to eliminate vertical drift/noise')
+    parser.add_argument('--diagnostics', action=argparse.BooleanOptionalAction, default=False, help='Enable diagnostics and metrics logging')
     args = parser.parse_args()
+
+    metrics_logger.configure(enabled=args.diagnostics)
 
     print(f"OfflineRunner: Starting processing on {args.bag_path} using IMU model: {args.imu_model}")
     
@@ -130,6 +175,9 @@ def main():
     tracker.set_calibration(K_d_mat, R_D2C, T_D2C)
     
     surfel_map = SurfelMap(FX_C, FY_C, CX_C, CY_C)
+    _global_state['surfel_map'] = surfel_map
+    _global_state['save_map_path'] = args.save_map
+    _global_state['bag_path'] = args.bag_path
     loop_detector = LoopDetector(FX_C, FY_C, CX_C, CY_C)
     pgo = PoseGraphOptimizer()
     
@@ -206,6 +254,7 @@ def main():
             time_diff = abs(latest_color_t - latest_depth_t) * 1e-6  # ms
             if time_diff < 30.0:  # sync within 30 ms
                 frame_t = min(latest_color_t, latest_depth_t)
+                metrics_logger.start_frame(frame_count, float(frame_t) * 1e-9)
                 z_drift = 0.0
                 frame_dt = 0.033
                 if frame_count > 0 and last_frame_t is not None:
@@ -217,19 +266,37 @@ def main():
                 
                 was_initialized = eskf.is_gravity_initialized
                 
+                accel_samples = []
+                gyro_samples = []
+                t_start_imu = time.perf_counter()
                 for imu_t, imu_type, imu_val in imu_history:
                     if imu_t < frame_t:
                         if imu_type == 'accel':
                             curr_acc = imu_val
                             accel_received = True
+                            accel_samples.append(imu_val)
                         elif imu_type == 'gyro':
                             curr_gyr = imu_val
+                            gyro_samples.append(imu_val)
                         
                         if last_imu_t is not None and accel_received:
                             dt = (imu_t - last_imu_t) * 1e-9
                             if dt > 0:
                                 eskf.predict(dt, curr_acc, curr_gyr)
                         last_imu_t = imu_t
+                t_imu_prop = time.perf_counter() - t_start_imu
+                metrics_logger.log("imu_propagation_time", t_imu_prop)
+                
+                if len(accel_samples) > 0:
+                    accel_vars = np.var(accel_samples, axis=0)
+                    metrics_logger.log("accel_var_x", float(accel_vars[0]))
+                    metrics_logger.log("accel_var_y", float(accel_vars[1]))
+                    metrics_logger.log("accel_var_z", float(accel_vars[2]))
+                if len(gyro_samples) > 0:
+                    gyro_vars = np.var(gyro_samples, axis=0)
+                    metrics_logger.log("gyro_var_x", float(gyro_vars[0]))
+                    metrics_logger.log("gyro_var_y", float(gyro_vars[1]))
+                    metrics_logger.log("gyro_var_z", float(gyro_vars[2]))
                 
                 # Clean up old IMU history
                 imu_history = [x for x in imu_history if x[0] >= frame_t]
@@ -246,6 +313,9 @@ def main():
                 
                 # C. GPU Depth Registration
                 depth_m = tracker.register_depth(latest_depth)
+                metrics_logger.log("image_width", latest_color.shape[1])
+                metrics_logger.log("image_height", latest_color.shape[0])
+                metrics_logger.log("valid_depth_pct", float(np.mean(depth_m > 0.1) * 100.0) if depth_m is not None else 0.0)
                 
                 # D. Alignment / Tracking
                 if frame_count == 0:
@@ -347,10 +417,12 @@ def main():
                         if t_dist > KF_TRANS_THRESH or r_dist > KF_ROT_THRESH:
                             is_kf = True
                             
+                    metrics_logger.log("kf_inserted", is_kf)
                     if is_kf:
                         kf_id = kf_count
                         kf_count += 1
                         last_kf_pose = T_wc.copy()
+                        metrics_logger.log("kf_id", kf_id)
                         
                         # Add keyframe to loop recognition database
                         loop_detector.add_keyframe(kf_id, latest_color, depth_m, T_wc)
@@ -363,7 +435,9 @@ def main():
                             pgo.add_loop_factor(cand_kf_id, kf_id, T_cand_curr)
                             
                             # Optimize graph and propagate deformation to surfels
+                            t_start_pgo = time.perf_counter()
                             optimized_poses = pgo.optimize()
+                            metrics_logger.log("pgo_time", time.perf_counter() - t_start_pgo)
                             
                             # Vectorized map deformation
                             with torch.no_grad():
@@ -395,12 +469,15 @@ def main():
                             surfel_map.merge_voxels()
                     
                     # H. Fuse current frame into the global map
+                    t_start_mapping = time.perf_counter()
                     surfel_map.fuse_frame(latest_color, depth_m, T_wc, frame_count, kf_count - 1)
                     
                     # Periodic pruning of unstable surfels
                     if frame_count % 30 == 0:
                         surfel_map.prune_unstable(frame_count, min_weight=3.0)
-                        
+                    t_mapping_time = time.perf_counter() - t_start_mapping
+                    metrics_logger.log("mapping_time", t_mapping_time)
+                    
                     # Live Visualisation
                     if visualizer is not None:
                         visualizer.update(T_wc, surfel_map, latest_color, depth_m, z_drift=z_drift)
@@ -408,16 +485,29 @@ def main():
                             print("\nOfflineRunner: Save & Exit requested from HUD buttons. Exiting loop...", flush=True)
                             break
                         
+                # End frame metrics logging
+                metrics_logger.end_frame()
+
                 # Progress logging
                 if frame_count % 50 == 0:
                     fps = (frame_count + 1) / (time.time() - start_time)
                     print(f"OfflineRunner: Processed {frame_count} frames, KF: {kf_count}, Surfels: {surfel_map.active_n}, Speed: {fps:.2f} FPS")
+                
+                # Periodically release PyTorch cached memory to prevent CUDA OOM
+                if frame_count % 100 == 0:
+                    torch.cuda.empty_cache()
                 
                 # Keep prev frames for visual tracking
                 latest_color_prev = latest_color.copy()
                 depth_m_prev = depth_m.copy()
                 T_wc_prev = T_wc.copy()
                 frame_count += 1
+                _global_state['frame_count'] = frame_count
+                
+                # Periodically save a running checkpoint of the map to disk (non-intrusive)
+                if frame_count > 0 and frame_count % 500 == 0:
+                    print(f"\nOfflineRunner: Periodically saving running map checkpoint to {args.save_map}...", flush=True)
+                    surfel_map.export_ply(args.save_map)
                 
                 # Clear frame buffers
                 latest_color = None
@@ -429,7 +519,17 @@ def main():
     
     os.makedirs(os.path.dirname(args.save_map), exist_ok=True)
     surfel_map.export_ply(args.save_map)
-    print(f"OfflineRunner: Reconstructed {surfel_map.active_n} surfels in {time.time() - start_time:.2f} seconds.")
+    
+    # Save unique timestamped map
+    import datetime
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    bag_name = os.path.basename(os.path.normpath(args.bag_path))
+    unique_save_path = f'/home/rv/RAM_VI_SLAM/output/map_{bag_name}_{timestamp}.ply'
+    surfel_map.export_ply(unique_save_path)
+    
+    _global_state['saved'] = True
+    metrics_logger.save_and_close()
+    print(f"OfflineRunner: Reconstructed {surfel_map.active_n} surfels in {time.time() - start_time:.2f} seconds. Maps saved to {args.save_map} and {unique_save_path}")
     
     if visualizer is not None:
         visualizer.destroy()

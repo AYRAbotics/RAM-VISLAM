@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.spatial.transform import Rotation
+from .diagnostics import metrics_logger
 
 def skew(v):
     return np.array([
@@ -121,6 +122,7 @@ class ESKF:
         r_p = p_meas - self.p
         r_theta = (self.R.inv() * Rotation.from_matrix(R_meas)).as_rotvec()
         y = np.concatenate([r_p, r_theta])
+        metrics_logger.log("eskf_innovation_norm", np.linalg.norm(y))
         
         # Measurement matrix H
         H = np.zeros((6, 15))

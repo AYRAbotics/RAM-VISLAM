@@ -5,6 +5,9 @@ from scipy.spatial.transform import Rotation
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+import time
+from .diagnostics import metrics_logger
+
 class RGBDTracker:
     def __init__(self, fx_c, fy_c, cx_c, cy_c, width=640, height=480):
         self.width = width
@@ -138,6 +141,7 @@ class RGBDTracker:
         option.depth_min = 0.1
         option.depth_max = 8.0
 
+        t_start_odom = time.perf_counter()
         try:
             success, T_odom, info = o3d.pipelines.odometry.compute_rgbd_odometry(
                 src_rgbd, tgt_rgbd, self.intrinsic_o3d, T_init_point,
@@ -146,11 +150,15 @@ class RGBDTracker:
             )
         except Exception:
             success = False
+        t_odom_time = time.perf_counter() - t_start_odom
+        metrics_logger.log("rgbd_odom_time", t_odom_time)
 
         if not success:
             T_odom = T_init_point
 
         # 2. Point-to-Plane ICP refinement
+        t_start_icp = time.perf_counter()
+        icp_success = False
         try:
             src_pcd = o3d.geometry.PointCloud.create_from_rgbd_image(src_rgbd, self.intrinsic_o3d)
             tgt_pcd = o3d.geometry.PointCloud.create_from_rgbd_image(tgt_rgbd, self.intrinsic_o3d)
@@ -166,12 +174,24 @@ class RGBDTracker:
                 o3d.pipelines.registration.TransformationEstimationPointToPlane()
             )
             
+            # Log ICP metrics
+            metrics_logger.log("icp_fitness", icp_result.fitness)
+            metrics_logger.log("icp_rmse", icp_result.inlier_rmse)
+            metrics_logger.log("icp_correspondences", len(icp_result.correspondence_set))
+            
             # Verify tracking fitness
             if icp_result.fitness > 0.30:
+                icp_success = True
+                t_icp_time = time.perf_counter() - t_start_icp
+                metrics_logger.log("icp_time", t_icp_time)
+                metrics_logger.log("tracking_success", True)
                 # Return target -> source transform by inverting the src -> tgt result
                 return True, np.linalg.inv(icp_result.transformation)
         except Exception:
             pass
 
+        t_icp_time = time.perf_counter() - t_start_icp
+        metrics_logger.log("icp_time", t_icp_time)
+        metrics_logger.log("tracking_success", success)
         # If ICP fails, return success and target -> source camera motion
         return success, np.linalg.inv(T_odom)
