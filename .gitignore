@@ -27,3 +27,6 @@ env/
 .gemini/
 .antigravity-ide/
 .antigravityignore
+
+# Archives and build artifacts
+*.zip

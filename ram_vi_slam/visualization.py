@@ -10,7 +10,7 @@ class SLAMVisualizer:
         
         # 1. 3D Open3D Visualizer Setup
         self.vis = o3d.visualization.Visualizer()
-        self.vis.create_window(window_name="RAM-SLAM 3D Map (ElasticFusion Style)", width=1024, height=768)
+        self.vis.create_window(window_name="RAM-VI SLAM 3D Map", width=1024, height=768)
         
         if gravity_aligned:
             # Coordinate system alignment: World uses ROS standard (+Z UP, -Y FORWARD)
@@ -78,7 +78,7 @@ class SLAMVisualizer:
         self.view_mode = "free" # "free", "follow", "top"
         self.z_lock = True
         self.save_requested = False
-        self.hud_window_name = "RAM-SLAM Tracking HUD (ElasticFusion)"
+        self.hud_window_name = "RAM-VI SLAM Tracking HUD"
         cv2.namedWindow(self.hud_window_name)
         cv2.setMouseCallback(self.hud_window_name, self.on_mouse)
 

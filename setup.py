@@ -17,7 +17,10 @@ setup(
     zip_safe=True,
     maintainer='rv',
     maintainer_email='rv@todo.todo',
-    description='Dense Visual-Inertial SLAM based on ElasticFusion philosophy with ESKF and DINOv2 loop closure',
+    description='Dense Visual-Inertial SLAM (RAM-VI SLAM) with ESKF and DINOv2 loop closure',
+    package_data={
+        package_name: ['*.so'],
+    },
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
