@@ -70,6 +70,10 @@ class SlamNode(Node):
         self.flat_ground = self.get_parameter('flat_ground').get_value()
         self.declare_parameter('enable_diagnostics', False)
         self.enable_diagnostics = self.get_parameter('enable_diagnostics').get_value()
+        self.declare_parameter('enable_depth_filter', False)
+        self.enable_depth_filter = self.get_parameter('enable_depth_filter').get_value()
+        self.declare_parameter('adaptive_radii', False)
+        self.adaptive_radii = self.get_parameter('adaptive_radii').get_value()
         self.z_fixed = 0.0
         self.z_fixed_initialized = False
         
@@ -282,7 +286,7 @@ class SlamNode(Node):
             T_pred = T_wi @ self.T_c2i
 
         # 3. GPU Depth Registration
-        depth_m = self.tracker.register_depth(depth_np)
+        depth_m = self.tracker.register_depth(depth_np, color_guide_np=color_rgb, enable_depth_filter=self.enable_depth_filter)
         metrics_logger.log("image_width", color_rgb.shape[1])
         metrics_logger.log("image_height", color_rgb.shape[0])
         metrics_logger.log("valid_depth_pct", float(np.mean(depth_m > 0.1) * 100.0) if depth_m is not None else 0.0)
@@ -400,7 +404,7 @@ class SlamNode(Node):
             # 5. Fuse frame into global surfel map
             t_start_mapping = time.perf_counter()
             with self.map_lock:
-                self.surfel_map.fuse_frame(color_rgb, depth_m, self.T_wc, self.frame_count, self.kf_count - 1)
+                self.surfel_map.fuse_frame(color_rgb, depth_m, self.T_wc, self.frame_count, self.kf_count - 1, adaptive_radii=self.adaptive_radii)
                 
                 if self.frame_count % 30 == 0:
                     self.surfel_map.prune_unstable(self.frame_count, min_weight=3.0)

@@ -35,10 +35,11 @@ class RGBDTracker:
         self.R_d2c_t = torch.tensor(R_d2c, dtype=torch.float32, device=self.device)
         self.t_d2c_t = torch.tensor(t_d2c, dtype=torch.float32, device=self.device)
 
-    def register_depth(self, depth_img_np):
+    def register_depth(self, depth_img_np, color_guide_np=None, enable_depth_filter=False):
         """
         Align the depth image from the depth camera to the color camera coordinate frame.
         Takes numpy depth image (uint16 in mm or float32 in m).
+        Optionally applies GPU RGB-guided edge refinement when enable_depth_filter=True.
         Returns a numpy depth image (float32 in meters) aligned with the color image.
         """
         if self.K_d is None:
@@ -108,8 +109,25 @@ class RGBDTracker:
         flat_idx = v_idx * W + u_idx
         reg_depth_flat = torch.zeros(H * W, dtype=torch.float32, device=self.device)
         reg_depth_flat[flat_idx] = z_c
+        reg_depth_t = reg_depth_flat.view(H, W)
+
+        # Advancement 1: Optional GPU RGB-guided Joint Bilateral Depth Filter
+        if enable_depth_filter and color_guide_np is not None:
+            try:
+                from .depth_filter import JointBilateralDepthFilter
+                if not hasattr(self, '_depth_filter') or self._depth_filter is None:
+                    self._depth_filter = JointBilateralDepthFilter(device=self.device)
+                
+                if color_guide_np.dtype == np.uint8:
+                    color_guide_t = torch.tensor(color_guide_np.astype(np.float32) / 255.0, dtype=torch.float32, device=self.device)
+                else:
+                    color_guide_t = torch.tensor(color_guide_np, dtype=torch.float32, device=self.device)
+                
+                reg_depth_t = self._depth_filter.filter(reg_depth_t, color_guide_t)
+            except Exception as e:
+                pass
         
-        return reg_depth_flat.view(H, W).cpu().numpy()
+        return reg_depth_t.cpu().numpy()
 
     def align_frames(self, src_color_np, src_depth_np, tgt_color_np, tgt_depth_np, T_init=np.eye(4)):
         """

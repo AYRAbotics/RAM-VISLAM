@@ -116,6 +116,8 @@ def main():
     parser.add_argument('--pitch_offset', type=float, default=0.0, help='Camera-IMU pitch offset in degrees')
     parser.add_argument('--yaw_offset', type=float, default=0.0, help='Camera-IMU yaw offset in degrees')
     parser.add_argument('--flat_ground', action=argparse.BooleanOptionalAction, default=True, help='Enforce flat ground constraint (constant height) to eliminate vertical drift/noise')
+    parser.add_argument('--enable_depth_filter', action=argparse.BooleanOptionalAction, default=False, help='Advancement 1: Enable GPU RGB-Guided Joint Bilateral Depth Filter for sharp edges')
+    parser.add_argument('--adaptive_radii', action=argparse.BooleanOptionalAction, default=False, help='Advancement 2: Enable Perspective-Adaptive Surfel Radii (Keller / ElasticFusion formulation)')
     parser.add_argument('--diagnostics', action=argparse.BooleanOptionalAction, default=False, help='Enable diagnostics and metrics logging')
     args = parser.parse_args()
 
@@ -312,7 +314,7 @@ def main():
                     T_pred = T_wi @ T_c2i
                 
                 # C. GPU Depth Registration
-                depth_m = tracker.register_depth(latest_depth)
+                depth_m = tracker.register_depth(latest_depth, color_guide_np=latest_color, enable_depth_filter=args.enable_depth_filter)
                 metrics_logger.log("image_width", latest_color.shape[1])
                 metrics_logger.log("image_height", latest_color.shape[0])
                 metrics_logger.log("valid_depth_pct", float(np.mean(depth_m > 0.1) * 100.0) if depth_m is not None else 0.0)
@@ -470,7 +472,7 @@ def main():
                     
                     # H. Fuse current frame into the global map
                     t_start_mapping = time.perf_counter()
-                    surfel_map.fuse_frame(latest_color, depth_m, T_wc, frame_count, kf_count - 1)
+                    surfel_map.fuse_frame(latest_color, depth_m, T_wc, frame_count, kf_count - 1, adaptive_radii=args.adaptive_radii)
                     
                     # Periodic pruning of unstable surfels
                     if frame_count % 30 == 0:

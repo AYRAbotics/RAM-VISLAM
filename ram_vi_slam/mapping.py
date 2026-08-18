@@ -155,10 +155,11 @@ class SurfelMap:
         # For each surfel, neighbors count = voxel count - 1
         self.local_density[:self.active_n] = torch.clamp(counts[inverse_indices].float() - 1.0, min=0.0)
 
-    def fuse_frame(self, color_img, depth_aligned, T_wc, frame_id, kf_id, icp_fitness=None):
+    def fuse_frame(self, color_img, depth_aligned, T_wc, frame_id, kf_id, icp_fitness=None, adaptive_radii=False):
         """
         Fuses a new aligned RGB-D frame into the surfel map.
         T_wc: 4x4 homogenous camera-to-world transform.
+        adaptive_radii: If True, uses perspective-projective surfel radius.
         """
         fused_n = 0
         # Transfer current frame to GPU
@@ -360,7 +361,18 @@ class SurfelMap:
             self.normals[new_s_indices]   = normals_world[spawn_mask]
             self.colors[new_s_indices]    = color_t[spawn_mask]
             self.weights[new_s_indices]   = 1.0
-            self.radii[new_s_indices]     = 0.01 + 0.01 * (pts_cam[spawn_mask, 2] / 4.0)
+            
+            # Advancement 2: Perspective-adaptive surfel radii (Keller / ElasticFusion formulation)
+            if adaptive_radii:
+                z_vals = pts_cam[spawn_mask, 2]
+                cos_theta = torch.clamp(torch.abs(normals_cam[spawn_mask, 2]), min=0.35, max=1.0)
+                # r = sqrt(2) * z / (fx * cos_theta)
+                r_calc = (1.41421356 * z_vals) / (self.fx * cos_theta)
+                self.radii[new_s_indices] = torch.clamp(r_calc, min=0.003, max=0.035)
+            else:
+                # Baseline radius heuristic
+                self.radii[new_s_indices] = 0.01 + 0.01 * (pts_cam[spawn_mask, 2] / 4.0)
+                
             self.ages[new_s_indices]      = frame_id
             self.kf_ids[new_s_indices]    = kf_id
             

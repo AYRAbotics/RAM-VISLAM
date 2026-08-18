@@ -30,3 +30,6 @@ env/
 
 # Archives and build artifacts
 *.zip
+scratch/
+.tempmediaStorage/
+
