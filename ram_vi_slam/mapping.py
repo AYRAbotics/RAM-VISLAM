@@ -263,10 +263,18 @@ class SurfelMap:
             f_pos = pts_world[fuse_mask]
             f_nor = normals_world[fuse_mask]
             
-            pos_diff = torch.norm(m_pos - f_pos, dim=-1)
+            # Point-to-plane distance (distance along map surfel normal)
+            diff_pos = m_pos - f_pos
+            d_plane = torch.abs(torch.sum(diff_pos * m_nor, dim=-1))
+            
+            # In-plane tangential distance
+            d_tangent_sq = torch.sum(diff_pos * diff_pos, dim=-1) - d_plane * d_plane
+            d_tangent = torch.sqrt(torch.clamp(d_tangent_sq, min=0.0))
+            
             nor_align = torch.sum(m_nor * f_nor, dim=-1)
             
-            compatible = (pos_diff < 0.05) & (nor_align > 0.75)
+            # Point-to-plane surfel compatibility: allow tangential sliding while gating perpendicular plane distance (<4.0cm for S-sweeps)
+            compatible = (d_plane < 0.040) & (d_tangent < 0.08) & (nor_align > 0.65)
             
             # Increment observation counts and update last observed frames for ALL observed surfels
             observed_s_idx = s_idx
@@ -296,37 +304,40 @@ class SurfelMap:
                 diff_pos_old = comp_f_pos - self.positions[comp_s_idx]
                 diff_nor_old = comp_f_nor - self.normals[comp_s_idx]
                 
-                # Perform weighted update of nominal attributes
+                # Dynamic weight clamping (max 10.0) enables surfels to snap and align to consensus surface plane across sweeps
                 w_old = self.weights[comp_s_idx]
+                w_eff = torch.clamp(w_old, max=10.0)
+                w_eff_new = w_eff + 1.0
                 w_new = w_old + 1.0
                 
-                self.positions[comp_s_idx] = (self.positions[comp_s_idx] * w_old.unsqueeze(-1) + comp_f_pos) / w_new.unsqueeze(-1)
+                self.positions[comp_s_idx] = (self.positions[comp_s_idx] * w_eff.unsqueeze(-1) + comp_f_pos) / w_eff_new.unsqueeze(-1)
                 
-                new_nor = (self.normals[comp_s_idx] * w_old.unsqueeze(-1) + comp_f_nor) / w_new.unsqueeze(-1)
+                new_nor = (self.normals[comp_s_idx] * w_eff.unsqueeze(-1) + comp_f_nor) / w_eff_new.unsqueeze(-1)
                 self.normals[comp_s_idx] = new_nor / torch.norm(new_nor, dim=-1, keepdim=True)
                 
-                # Calculate differences with new means
+                # Calculate differences with new means (using effective-weight-adjusted positions)
                 diff_pos_new = comp_f_pos - self.positions[comp_s_idx]
                 diff_nor_new = comp_f_nor - self.normals[comp_s_idx]
                 
-                # Update running variances using Welford's formula
-                m2_pos_old = self.position_variance[comp_s_idx] * w_old
+                # Update running variances using Welford's formula (use w_eff for responsiveness)
+                m2_pos_old = self.position_variance[comp_s_idx] * w_eff
                 m2_pos_new = m2_pos_old + torch.sum(diff_pos_old * diff_pos_new, dim=-1)
-                self.position_variance[comp_s_idx] = m2_pos_new / w_new
+                self.position_variance[comp_s_idx] = m2_pos_new / w_eff_new
                 
-                m2_nor_old = self.normal_variance[comp_s_idx] * w_old
+                m2_nor_old = self.normal_variance[comp_s_idx] * w_eff
                 m2_nor_new = m2_nor_old + torch.sum(diff_nor_old * diff_nor_new, dim=-1)
-                self.normal_variance[comp_s_idx] = m2_nor_new / w_new
+                self.normal_variance[comp_s_idx] = m2_nor_new / w_eff_new
                 
-                # Update running averages
-                self.average_depth_confidence[comp_s_idx] = (self.average_depth_confidence[comp_s_idx] * w_old + comp_f_depth_conf) / w_new
-                self.average_icp_fitness[comp_s_idx] = (self.average_icp_fitness[comp_s_idx] * w_old + icp_fitness) / w_new
-                self.average_viewing_angle[comp_s_idx] = (self.average_viewing_angle[comp_s_idx] * w_old + comp_f_view_angle) / w_new
+                # Update running averages using effective weights so high-weight surfels remain responsive
+                self.average_depth_confidence[comp_s_idx] = (self.average_depth_confidence[comp_s_idx] * w_eff + comp_f_depth_conf) / w_eff_new
+                self.average_icp_fitness[comp_s_idx] = (self.average_icp_fitness[comp_s_idx] * w_eff + icp_fitness) / w_eff_new
+                self.average_viewing_angle[comp_s_idx] = (self.average_viewing_angle[comp_s_idx] * w_eff + comp_f_view_angle) / w_eff_new
                 
                 # Update confidence_score field
                 self.confidence_score[comp_s_idx] = self.average_depth_confidence[comp_s_idx] * (1.0 - torch.exp(-0.1 * self.observation_count[comp_s_idx]))
                 
-                self.colors[comp_s_idx] = (self.colors[comp_s_idx] * w_old.unsqueeze(-1) + comp_f_col) / w_new.unsqueeze(-1)
+                # Update color with effective weight (keeps colors fresh across sweeps)
+                self.colors[comp_s_idx] = (self.colors[comp_s_idx] * w_eff.unsqueeze(-1) + comp_f_col) / w_eff_new.unsqueeze(-1)
                 self.weights[comp_s_idx] = w_new
                 self.ages[comp_s_idx] = frame_id
 

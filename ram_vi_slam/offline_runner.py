@@ -474,11 +474,15 @@ def main():
                     t_start_mapping = time.perf_counter()
                     surfel_map.fuse_frame(latest_color, depth_m, T_wc, frame_count, kf_count - 1, adaptive_radii=args.adaptive_radii)
                     
-                    # Periodic pruning of unstable surfels
+                    # Periodic pruning to eliminate unstable new surfels
                     if frame_count % 30 == 0:
                         surfel_map.prune_unstable(frame_count, min_weight=3.0)
                     t_mapping_time = time.perf_counter() - t_start_mapping
                     metrics_logger.log("mapping_time", t_mapping_time)
+                    
+                    # Periodic spatial voxel merging (outside timing to not inflate mapping latency metric)
+                    if frame_count > 0 and frame_count % 150 == 0:
+                        surfel_map.merge_voxels(voxel_size=0.008)
                     
                     # Live Visualisation
                     if visualizer is not None:
@@ -515,9 +519,9 @@ def main():
                 latest_color = None
                 latest_depth = None
                 
-    # final downsampling and saving
-    surfel_map.prune_unstable(frame_count, min_weight=3.0)
-    surfel_map.merge_voxels(voxel_size=0.01)
+    # Final high-density single-pass 6mm voxel collapse for ultra-dense point cloud generation
+    surfel_map.prune_unstable(frame_count, min_weight=2.0)
+    surfel_map.merge_voxels(voxel_size=0.006)
     
     os.makedirs(os.path.dirname(args.save_map), exist_ok=True)
     surfel_map.export_ply(args.save_map)

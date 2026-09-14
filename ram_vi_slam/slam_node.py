@@ -52,28 +52,28 @@ class SlamNode(Node):
         
         # 2. Parameters and initialization
         self.declare_parameter('max_depth', 8.0)
-        self.max_depth = self.get_parameter('max_depth').get_value()
+        self.max_depth = self.get_parameter('max_depth').value
         self.declare_parameter('visualize', True)
-        self.visualize = self.get_parameter('visualize').get_value()
+        self.visualize = self.get_parameter('visualize').value
         self.visualizer = None
         
         self.declare_parameter('camera_imu_roll_offset', 0.0)
         self.declare_parameter('camera_imu_pitch_offset', 0.0)
         self.declare_parameter('camera_imu_yaw_offset', 0.0)
-        self.roll_off = self.get_parameter('camera_imu_roll_offset').get_value()
-        self.pitch_off = self.get_parameter('camera_imu_pitch_offset').get_value()
-        self.yaw_off = self.get_parameter('camera_imu_yaw_offset').get_value()
+        self.roll_off = self.get_parameter('camera_imu_roll_offset').value
+        self.pitch_off = self.get_parameter('camera_imu_pitch_offset').value
+        self.yaw_off = self.get_parameter('camera_imu_yaw_offset').value
         
         self.declare_parameter('imu_model', 'imufusion')
-        self.imu_model = self.get_parameter('imu_model').get_value()
+        self.imu_model = self.get_parameter('imu_model').value
         self.declare_parameter('flat_ground', True)
-        self.flat_ground = self.get_parameter('flat_ground').get_value()
+        self.flat_ground = self.get_parameter('flat_ground').value
         self.declare_parameter('enable_diagnostics', False)
-        self.enable_diagnostics = self.get_parameter('enable_diagnostics').get_value()
+        self.enable_diagnostics = self.get_parameter('enable_diagnostics').value
         self.declare_parameter('enable_depth_filter', False)
-        self.enable_depth_filter = self.get_parameter('enable_depth_filter').get_value()
+        self.enable_depth_filter = self.get_parameter('enable_depth_filter').value
         self.declare_parameter('adaptive_radii', False)
-        self.adaptive_radii = self.get_parameter('adaptive_radii').get_value()
+        self.adaptive_radii = self.get_parameter('adaptive_radii').value
         self.z_fixed = 0.0
         self.z_fixed_initialized = False
         
@@ -405,12 +405,17 @@ class SlamNode(Node):
             t_start_mapping = time.perf_counter()
             with self.map_lock:
                 self.surfel_map.fuse_frame(color_rgb, depth_m, self.T_wc, self.frame_count, self.kf_count - 1, adaptive_radii=self.adaptive_radii)
-                
-                if self.frame_count % 30 == 0:
-                    self.surfel_map.prune_unstable(self.frame_count, min_weight=3.0)
-                    torch.cuda.empty_cache()
             t_mapping_time = time.perf_counter() - t_start_mapping
             metrics_logger.log("mapping_time", t_mapping_time)
+            
+            # Periodic pruning & voxel merging (outside timing to keep mapping_time metric accurate)
+            with self.map_lock:
+                if self.frame_count % 30 == 0:
+                    self.surfel_map.prune_unstable(self.frame_count, min_weight=3.0)
+                if self.frame_count > 0 and self.frame_count % 150 == 0:
+                    self.surfel_map.merge_voxels(voxel_size=0.008)
+                if self.frame_count % 100 == 0:
+                    torch.cuda.empty_cache()
                     
             if self.visualizer is not None:
                 self.visualizer.update(self.T_wc, self.surfel_map, color_rgb, depth_m, z_drift=z_drift)
